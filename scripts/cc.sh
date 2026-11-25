@@ -97,10 +97,16 @@ fi
 
 # --- P5 preflight: файловые bind-маунты (пропускаем для read-only команд диагностики) ---
 case "${SUBCMD}" in
-  config|exec) ;;
+  config|exec|build|pull) ;;
   *)
      [ -d data/nginx-dynamic ] || { echo "cc.sh: bind-mount directory missing: data/nginx-dynamic" >&2; exit 1; }
-    for f in nginx/nginx.conf data/nginx-dynamic/.htpasswd data/nginx-dynamic/cloudflare-ips.conf certbot/cli.ini scripts/certbot_deploy_hook.sh; do
+    for f in \
+      nginx/nginx.conf \
+      data/nginx-dynamic/.htpasswd \
+      data/nginx-dynamic/cloudflare-ips.conf \
+      certbot/cli.ini \
+      scripts/certbot_deploy_hook.sh
+    do
       [ -f "${f}" ] || { echo "cc.sh: bind-mount file missing: ${f}" >&2; exit 1; }
     done
     ;;

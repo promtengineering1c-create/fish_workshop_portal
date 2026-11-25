@@ -208,18 +208,36 @@ JOURNAL="⚠️**<journal.path>**"
 MIGRATION_MODE="⚠️**<migration.mode>**"
 
 require_value TARGET_DIR "$TARGET_DIR" path || exit 26
-require_value ROLLBACK_DIR "$ROLLBACK_DIR" path || exit 26
 require_value JOURNAL "$JOURNAL" path || exit 26
 require_value MIGRATION_MODE "$MIGRATION_MODE" plain || exit 26
 
+case "$MIGRATION_MODE" in
+    initial)
+        ;;
+    update)
+        require_value ROLLBACK_DIR "$ROLLBACK_DIR" path || exit 26
+        ;;
+    *)
+        echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2
+        exit 25
+        ;;
+esac
+
 TARGET_DIR="${TARGET_DIR%/}"
 
-mkdir -p "$TARGET_DIR" \
-         "$TARGET_DIR/data/nginx-dynamic" \
+DIRS_TO_CREATE=("$TARGET_DIR" "$(dirname -- "$JOURNAL")")
++[[ "$MIGRATION_MODE" == "update" ]] && DIRS_TO_CREATE+=("$ROLLBACK_DIR")
++
++for d in "${DIRS_TO_CREATE[@]}"; do
+    mkdir -p "$d" 2>/dev/null \
+        || { echo "STOP: нет прав на создание каталога '$d' для пользователя $(id -un); создайте родительский каталог с правами записи или смените путь в YAML" >&2; exit 1; }
+    [[ -w "$d" ]] \
+        || { echo "STOP: нет прав записи в каталог '$d' для пользователя $(id -un)" >&2; exit 1; }
+done
+
+mkdir -p "$TARGET_DIR/data/nginx-dynamic" \
          "$TARGET_DIR/data/ssl" \
-         "$TARGET_DIR/data/letsencrypt" \
-         "$ROLLBACK_DIR" \
-         "$(dirname -- "$JOURNAL")"
+         "$TARGET_DIR/data/letsencrypt"
 
 case "$MIGRATION_MODE" in
     initial)
@@ -337,24 +355,27 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 **Условия остановки:** Отсутствие утилит `iptables`/`ipset`, отсутствие прав `root` или `sudo -n`, отсутствие/пустота цепочки `DOCKER-USER` либо отсутствие/неполнота набора `cf_ips_v4`.
 
-### 2.9. Проверка обратного доступа «целевой → исходный»
+### 2.9. Проверка прямого доступа «исходный → целевой» (Push)
 
-**Место выполнения:** целевой сервер, Bash.
+**Место выполнения:** исходный сервер, Bash.
 
-Шаги 4.2 (варианты Б и В), 4.3, 4.4 (вариант В) и 5.1 тянут данные с исходного сервера по SSH. Ключевая аутентификация должна работать в обе стороны, запрос пароля недопустим: `rsync` в неинтерактивном режиме при отсутствии ключа зависнет или упадёт.
+*(Выполняется, если задействован перенос с исходного сервера: `code_delivery.method` ∈ `{local_git, no_git}`, `migration.mode = initial` для `4.3.1.А`, `images.method = transfer` или `storage.items` с `transfer: true`. В `update` при `remote_git` + `build`/`registry` и `storage.items: []` шаг пропускается)*
+
+Шаги 4.2 (варианты Б и В), 4.3.1.А, 4.4 (вариант В) и 5.1 отправляют данные с исходного сервера на целевой по SSH. Ключевая аутентификация должна работать без запроса пароля (по ключу либо через `ssh -A` на время сессии).
 
 ```bash
-SOURCE_SSH_PORT=⚠️**<source.ssh.port>**
-SOURCE_SSH_USER=⚠️**<source.ssh.user>**
-SOURCE_SSH_HOST=⚠️**<source.ssh.host>**
+TARGET_SSH_PORT=⚠️**<target.ssh.port>**
+TARGET_SSH_USER=⚠️**<target.ssh.user>**
+TARGET_SSH_HOST=⚠️**<target.ssh.host>**
 
-ssh -p "$SOURCE_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
-    "$SOURCE_SSH_USER"@"$SOURCE_SSH_HOST" 'echo REVERSE_OK; id -un; command -v rsync'
+command -v rsync >/dev/null 2>&1 || { echo "STOP: rsync не найден на исходном сервере" >&2; exit 1; }
+ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
+    "$TARGET_SSH_USER"@"$TARGET_SSH_HOST" 'echo PUSH_OK; id -un; command -v rsync'
 ```
 
-**Ожидаемый результат:** `REVERSE_OK`, имя пользователя совпадает с `source.ssh.user`, путь к `rsync` выведен.
+**Ожидаемый результат:** `PUSH_OK`, имя пользователя совпадает с `target.ssh.user`, `rsync` присутствует на обоих серверах.
 
-**Условия остановки:** `Permission denied`, `Host key verification failed`, таймаут, отсутствие `rsync` на исходном сервере.
+**Условия остановки:** `Permission denied`, `Host key verification failed`, таймаут, отсутствие `rsync` на исходном или целевом сервере.
 
 ### 2.10.1. Проверка прав чтения на исходном сервере
 
@@ -557,17 +578,36 @@ if [[ "$REQUIRE_FIREWALL" == "1" ]]; then
     FW_TOOLS_STATUS="ok"
 fi
 
+CHGRP_STATUS="ok(root)"
+if [[ "${EUID}" -ne 0 ]]; then
+    if [[ "$MIGRATION_MODE" == "initial" || ! -s "$TARGET_DIR/data/nginx-dynamic/.htpasswd" ]]; then
+        NGINX_GID="${NGINX_WORKER_GID:-101}"
+        CHGRP_PROBE="$(mktemp "$TARGET_DIR/data/nginx-dynamic/.htpasswd.probe.XXXXXX")"
+        trap 'rm -f "${CHGRP_PROBE:-}"' EXIT
+        if sudo -n chgrp "${NGINX_GID}" "$CHGRP_PROBE" >/dev/null 2>&1; then
+            CHGRP_STATUS="ok(sudo)"
+        else
+            echo "STOP: требуется NOPASSWD sudo для 'chgrp ${NGINX_GID}' при генерации .htpasswd на шаге 4.3.2 (ADR-010)" >&2
+            exit 1
+        fi
+        rm -f "$CHGRP_PROBE"
+        trap - EXIT
+    else
+        CHGRP_STATUS="skipped(existing .htpasswd)"
+    fi
+fi
+
 STEP=2.13
 DATE_UTC="$(date -u +%FT%T)"
 NOTE="Инструментарий целевого сервера проверен"
-OUTPUT="base=ok; htpasswd=${HTPASSWD_STATUS}; fw_tools=${FW_TOOLS_STATUS}"
+OUTPUT="base=ok; htpasswd=${HTPASSWD_STATUS}; chgrp=${CHGRP_STATUS}; fw_tools=${FW_TOOLS_STATUS}"
 printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 )
 ```
 
-**Ожидаемый результат:** На целевом сервере установлены `python3` (нужен `scripts/render_check.py` внутри `scripts/cc.sh`), `rsync`, `tar`, `gzip`, `curl`, `openssl`, `sha256sum`; при `mode = initial` (или отсутствии готового `.htpasswd`) доступна утилита `htpasswd`; для `production` (или `REQUIRE_FIREWALL=1`) доступны `iptables` и `ipset`.
+*Ожидаемый результат:** На целевом сервере установлены `python3` (нужен `scripts/render_check.py` внутри `scripts/cc.sh`), `rsync`, `tar`, `gzip`, `curl`, `openssl`, `sha256sum`; при `mode = initial` (или отсутствии готового `.htpasswd`) доступна утилита `htpasswd` и подтверждено право `chgrp` (от `root` или через `sudo -n`) на группу worker-процесса Nginx; для `production` (или `REQUIRE_FIREWALL=1`) доступны `iptables` и `ipset`.
 
-**Условия остановки:** Отсутствие любой обязательной утилиты, отсутствие `htpasswd` при `mode = initial` или отсутствие `iptables`/`ipset` при `REQUIRE_FIREWALL=1`.
+**Условия остановки:** Отсутствие любой обязательной утилиты, отсутствие `htpasswd` или прав `sudo -n chgrp` при `mode = initial` (либо отсутствии `.htpasswd`), или отсутствие `iptables`/`ipset` при `REQUIRE_FIREWALL=1`.
 
 ## 3. Резервное копирование текущего состояния (только для `update`)
 
@@ -852,11 +892,11 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 ### 4.2. Доставка кода проекта
 
-**Место выполнения:** целевой сервер, Bash.
-
 *(Выполняется строго один вариант в соответствии со значением `migration.config.yaml: code_delivery.method` — `remote_git`, `local_git` или `no_git`)*
 
 #### Вариант А (`code_delivery.method = remote_git`)
+
+**Место выполнения:** целевой сервер, Bash.
 
 ```bash
 (
@@ -914,19 +954,21 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 #### Вариант Б (`code_delivery.method = local_git`)
 
+**Место выполнения:** исходный сервер, Bash.
+
 ```bash
 (
 set -Eeuo pipefail
 
 TARGET_DIR="⚠️**<target.project_dir>**"
+SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
 CODE_DELIVERY_METHOD="⚠️**<code_delivery.method>**"
 CODE_REF="⚠️**<code_delivery.ref>**"
-SOURCE_SSH_PORT="⚠️**<source.ssh.port>**"
-SOURCE_SSH_USER="⚠️**<source.ssh.user>**"
-SOURCE_SSH_HOST="⚠️**<source.ssh.host>**"
-SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
+TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
+TARGET_SSH_USER="⚠️**<target.ssh.user>**"
+TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
 
-for v in TARGET_DIR CODE_DELIVERY_METHOD CODE_REF SOURCE_SSH_PORT SOURCE_SSH_USER SOURCE_SSH_HOST SOURCE_PROJECT_DIR; do
+for v in TARGET_DIR SOURCE_PROJECT_DIR CODE_DELIVERY_METHOD CODE_REF TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST; do
     val="${!v}"
     [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
@@ -938,56 +980,54 @@ done
 TS="$(date -u +%Y%m%dT%H%M%SZ)_$$"
 SRC_BUNDLE="/tmp/repo_${TS}.bundle"
 TGT_BUNDLE="/tmp/repo_${TS}.bundle"
+BUNDLE_REF="refs/tmp/bundle_${TS}"
 
 cleanup() {
-    rm -f "${TGT_BUNDLE:-}"
-    ssh -p "$SOURCE_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
-        "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}" "rm -f '${SRC_BUNDLE:-}'" >/dev/null 2>&1 || true
+    rm -f "${SRC_BUNDLE:-}"
+    git -C "${SOURCE_PROJECT_DIR}" update-ref -d "${BUNDLE_REF}" >/dev/null 2>&1 || true
+    ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
+        "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" "rm -f '${TGT_BUNDLE:-}'" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-TARGET_COMMIT="$(
-    ssh -p "$SOURCE_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
-        "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}" bash -s -- "$SOURCE_PROJECT_DIR" "$CODE_REF" "$SRC_BUNDLE" <<'EOF'
-set -Eeuo pipefail
-SRC_DIR="$1"
-REF="$2"
-BUNDLE_PATH="$3"
+cd "$SOURCE_PROJECT_DIR"
+[[ -d .git ]] || { echo "STOP: на исходном сервере в '$SOURCE_PROJECT_DIR' отсутствует .git" >&2; exit 1; }
 
-cd "$SRC_DIR"
-[[ -d .git ]] || { echo "STOP: на исходном сервере в '$SRC_DIR' отсутствует .git" >&2; exit 1; }
-
-if git rev-parse --verify --quiet "refs/heads/${REF}^{commit}" >/dev/null; then
-    COMMIT="$(git rev-parse "refs/heads/${REF}^{commit}")"
-elif git rev-parse --verify --quiet "refs/tags/${REF}^{commit}" >/dev/null; then
-    COMMIT="$(git rev-parse "refs/tags/${REF}^{commit}")"
-elif git rev-parse --verify --quiet "${REF}^{commit}" >/dev/null; then
-    COMMIT="$(git rev-parse "${REF}^{commit}")"
+if git rev-parse --verify --quiet "refs/heads/${CODE_REF}^{commit}" >/dev/null; then
+    TARGET_COMMIT="$(git rev-parse "refs/heads/${CODE_REF}^{commit}")"
+elif git rev-parse --verify --quiet "refs/tags/${CODE_REF}^{commit}" >/dev/null; then
+    TARGET_COMMIT="$(git rev-parse "refs/tags/${CODE_REF}^{commit}")"
+elif git rev-parse --verify --quiet "${CODE_REF}^{commit}" >/dev/null; then
+    TARGET_COMMIT="$(git rev-parse "${CODE_REF}^{commit}")"
 else
-    echo "STOP: ссылка code_delivery.ref='$REF' не найдена в репозитории источника" >&2
+    echo "STOP: ссылка code_delivery.ref='$CODE_REF' не найдена в репозитории источника" >&2
     exit 1
 fi
 
-git bundle create "$BUNDLE_PATH" "$COMMIT" >/dev/null
-printf '%s\n' "$COMMIT"
-EOF
-)"
+git update-ref "$BUNDLE_REF" "$TARGET_COMMIT"
+git bundle create "$SRC_BUNDLE" "$BUNDLE_REF" >/dev/null
 
-[[ -n "$TARGET_COMMIT" ]] \
-    || { echo "STOP: не удалось создать git bundle на исходном сервере" >&2; exit 1; }
+rsync -az -e "ssh -p $TARGET_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
+    "$SRC_BUNDLE" "${TARGET_SSH_USER}@${TARGET_SSH_HOST}:${TGT_BUNDLE}"
 
-rsync -az -e "ssh -p $SOURCE_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
-    "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}:${SRC_BUNDLE}" "$TGT_BUNDLE"
+ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+    "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" bash -s -- "$TARGET_DIR" "$TGT_BUNDLE" "$BUNDLE_REF" "$TARGET_COMMIT" <<'EOF'
+set -Eeuo pipefail
+TGT_DIR="$1"
+BUNDLE_PATH="$2"
+REF_NAME="$3"
+COMMIT="$4"
 
-cd "$TARGET_DIR"
-git bundle verify "$TGT_BUNDLE" >/dev/null
-git fetch -q "$TGT_BUNDLE" "$TARGET_COMMIT"
-git checkout -q --detach "$TARGET_COMMIT"
+cd "$TGT_DIR"
+git bundle verify "$BUNDLE_PATH" >/dev/null
+git fetch -q "$BUNDLE_PATH" "$REF_NAME"
+git checkout -q --detach "$COMMIT"
 
 for req in docker-compose.yml scripts/deploy.sh scripts/cc.sh; do
     [[ -f "$req" ]] || { echo "STOP: в доставленном коде отсутствует обязательный файл '$req'" >&2; exit 1; }
 done
 chmod +x scripts/*.sh
+EOF
 
 STEP=4.2
 DATE_UTC="$(date -u +%FT%T)"
@@ -999,18 +1039,20 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 #### Вариант В (`code_delivery.method = no_git`)
 
+**Место выполнения:** исходный сервер, Bash.
+
 ```bash
 (
 set -Eeuo pipefail
 
 TARGET_DIR="⚠️**<target.project_dir>**"
-CODE_DELIVERY_METHOD="⚠️**<code_delivery.method>**"
-SOURCE_SSH_PORT="⚠️**<source.ssh.port>**"
-SOURCE_SSH_USER="⚠️**<source.ssh.user>**"
-SOURCE_SSH_HOST="⚠️**<source.ssh.host>**"
 SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
+CODE_DELIVERY_METHOD="⚠️**<code_delivery.method>**"
+TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
+TARGET_SSH_USER="⚠️**<target.ssh.user>**"
+TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
 
-for v in TARGET_DIR CODE_DELIVERY_METHOD SOURCE_SSH_PORT SOURCE_SSH_USER SOURCE_SSH_HOST SOURCE_PROJECT_DIR; do
+for v in TARGET_DIR SOURCE_PROJECT_DIR CODE_DELIVERY_METHOD TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST; do
     val="${!v}"
     [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
@@ -1028,19 +1070,23 @@ rsync -az --delete \
     --exclude='venv/' \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
-    -e "ssh -p $SOURCE_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
-    "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}:${SOURCE_PROJECT_DIR%/}/" "${TARGET_DIR%/}/"
+    -e "ssh -p $TARGET_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
+    "${SOURCE_PROJECT_DIR\%/}/" "${TARGET_SSH_USER}@${TARGET_SSH_HOST}:${TARGET_DIR%/}/"
 
-cd "$TARGET_DIR"
+ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+    "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" bash -s -- "$TARGET_DIR" <<'EOF'
+set -Eeuo pipefail
+cd "$1"
 for req in docker-compose.yml scripts/deploy.sh scripts/cc.sh; do
     [[ -f "$req" ]] || { echo "STOP: в доставленном коде отсутствует обязательный файл '$req'" >&2; exit 1; }
 done
 chmod +x scripts/*.sh
+EOF
 
 STEP=4.2
 DATE_UTC="$(date -u +%FT%T)"
 NOTE="Код синхронизирован с исходного сервера через rsync"
-OUTPUT="method=no_git; source=${SOURCE_SSH_HOST}:${SOURCE_PROJECT_DIR}"
+OUTPUT="method=no_git; target=${TARGET_SSH_HOST}:${TARGET_DIR}"
 printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 )
 ```
@@ -1051,9 +1097,68 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 ### 4.3. Доставка и настройка конфигурации окружения (`.env` и `.htpasswd`)
 
-**Место выполнения:** целевой сервер, Bash.
+#### 4.3.1.А. Доставка файлов `.env*` (`migration.mode = initial`)
 
-#### 4.3.1. Доставка (для `initial`) или сверка ключей (для `update`) файлов `.env*`
+**Место выполнения:** исходный сервер, Bash.
+
+```bash
+(
+set -Eeuo pipefail
+
+TARGET_DIR="⚠️**<target.project_dir>**"
+SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
+MIGRATION_MODE="⚠️**<migration.mode>**"
+APP_ENV="⚠️**<application.app_env>**"
+TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
+TARGET_SSH_USER="⚠️**<target.ssh.user>**"
+TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
+
+for v in TARGET_DIR SOURCE_PROJECT_DIR MIGRATION_MODE APP_ENV TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST; do
+    val="${!v}"
+    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
+        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
+done
+
+[[ "$MIGRATION_MODE" == "initial" ]] \
+    || { echo "STOP: выбран шаг 4.3.1.А (initial), но MIGRATION_MODE='$MIGRATION_MODE'" >&2; exit 25; }
+
+cd "$SOURCE_PROJECT_DIR"
+[[ -f ".env" || -f ".env.${APP_ENV}" ]] \
+    || { echo "STOP: на исходном сервере отсутствуют .env и .env.${APP_ENV}" >&2; exit 1; }
+
+rsync -az --chmod=F600 \
+    --include='.env' \
+    --include=".env.${APP_ENV}" \
+    --exclude='*' \
+    -e "ssh -p $TARGET_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
+    "${SOURCE_PROJECT_DIR%/}/" "${TARGET_SSH_USER}@${TARGET_SSH_HOST}:${TARGET_DIR%/}/"
+
+ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+    "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" bash -s -- "$TARGET_DIR" "$APP_ENV" <<'EOF'
+set -Eeuo pipefail
+cd "$1"
+APP_ENV="$2"
+[[ -f ".env.${APP_ENV}" || -f ".env" ]] \
+    || { echo "STOP: на целевой сервер не доставлен ни .env.${APP_ENV}, ни .env" >&2; exit 1; }
+shopt -s nullglob
+for f in .env .env.*; do
+    [[ "$f" == ".env.example" ]] && continue
+    chmod 600 "$f"
+done
+shopt -u nullglob
+EOF
+
+STEP=4.3.1
+DATE_UTC="$(date -u +%FT%T)"
+NOTE="Файлы окружения доставлены на целевой сервер"
+OUTPUT="mode=initial; app_env=${APP_ENV}; state=pushed from source (edit target-specific values before 4.3.2)"
+printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
+)
+```
+
+#### 4.3.1.Б. Сверка ключей файлов `.env*` (`migration.mode = update`)
+
+**Место выполнения:** целевой сервер, Bash.
 
 ```bash
 (
@@ -1069,53 +1174,22 @@ for v in TARGET_DIR MIGRATION_MODE APP_ENV; do
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
 done
 
+[[ "$MIGRATION_MODE" == "update" ]] \
+    || { echo "STOP: выбран шаг 4.3.1.Б (update), но MIGRATION_MODE='$MIGRATION_MODE'" >&2; exit 25; }
+
 cd "$TARGET_DIR"
+[[ -f ".env.${APP_ENV}" || -f ".env" ]] \
+    || { echo "STOP: на целевом сервере отсутствуют .env.${APP_ENV} и .env при mode=update" >&2; exit 1; }
 
-case "$MIGRATION_MODE" in
-    initial)
-        SOURCE_SSH_PORT="⚠️**<source.ssh.port>**"
-        SOURCE_SSH_USER="⚠️**<source.ssh.user>**"
-        SOURCE_SSH_HOST="⚠️**<source.ssh.host>**"
-        SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
+shopt -s nullglob
+for f in .env .env.*; do
+    [[ "$f" == ".env.example" ]] && continue
+    chmod 600 "$f"
+done
+shopt -u nullglob
 
-        for v in SOURCE_SSH_PORT SOURCE_SSH_USER SOURCE_SSH_HOST SOURCE_PROJECT_DIR; do
-            val="${!v}"
-            [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
-                || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
-        done
-
-        rsync -az \
-            --include='.env' \
-            --include=".env.${APP_ENV}" \
-            --exclude='*' \
-            -e "ssh -p $SOURCE_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
-            "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}:${SOURCE_PROJECT_DIR%/}/" "${TARGET_DIR%/}/"
-
-        [[ -f ".env.${APP_ENV}" || -f ".env" ]] \
-            || { echo "STOP: с исходного сервера не скопирован ни .env.${APP_ENV}, ни .env" >&2; exit 1; }
-
-        shopt -s nullglob
-        for f in .env .env.*; do
-            [[ "$f" == ".env.example" ]] && continue
-            chmod 600 "$f"
-        done
-        shopt -u nullglob
-
-        ENV_STATE="copied from source (edit target-specific values before 4.3.2)"
-        ;;
-    update)
-        [[ -f ".env.${APP_ENV}" || -f ".env" ]] \
-            || { echo "STOP: на целевом сервере отсутствуют .env.${APP_ENV} и .env при mode=update" >&2; exit 1; }
-
-        shopt -s nullglob
-        for f in .env .env.*; do
-            [[ "$f" == ".env.example" ]] && continue
-            chmod 600 "$f"
-        done
-        shopt -u nullglob
-
-        if [[ -f ".env.example" ]]; then
-            MISSING_KEYS="$(python3 - "$APP_ENV" <<'PY'
+if [[ -f ".env.example" ]]; then
+    MISSING_KEYS="$(python3 - "$APP_ENV" <<'PY'
 import re, sys
 from pathlib import Path
 
@@ -1142,29 +1216,23 @@ if missing:
     print('\n'.join(missing))
 PY
 )"
-            [[ -z "$MISSING_KEYS" ]] \
-                || { echo "STOP: в целевых .env / .env.${APP_ENV} отсутствуют новые ключи из .env.example:"$'\n'"$MISSING_KEYS" >&2; exit 1; }
-        fi
-
-        ENV_STATE="preserved and verified against .env.example"
-        ;;
-    *)
-        echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2
-        exit 25
-        ;;
-esac
+[[ -z "$MISSING_KEYS" ]] \
+        || { echo "STOP: в целевых .env / .env.${APP_ENV} отсутствуют новые ключи из .env.example:"$'\n'"$MISSING_KEYS" >&2; exit 1; }
+fi
 
 STEP=4.3.1
 DATE_UTC="$(date -u +%FT%T)"
 NOTE="Файлы окружения подготовлены"
-OUTPUT="mode=${MIGRATION_MODE}; app_env=${APP_ENV}; state=${ENV_STATE}"
+OUTPUT="mode=update; app_env=${APP_ENV}; state=preserved and verified against .env.example"
 printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 )
 ```
 
-*(При `migration.mode = initial` перед запуском `4.3.2` проверьте в `.env.<APP_ENV>` целевые значения: `APP_ENV`, домен, секреты, параметры БД и `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` для закрытых зон Nginx)*
+*(При `migration.mode = initial` перед запуском `4.3.2` проверьте целевые значения с соблюдением ADR-011: в базовом `.env` — креды и адрес БД (`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, без `POSTGRES_*`); в `.env.<APP_ENV>` — `APP_ENV`, `CANONICAL_HOST`, `LE_EMAIL`, секреты приложения и `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` для закрытых зон Nginx, без кредов БД и `POSTGRES_*`)*
 
 #### 4.3.2. Генерация `.htpasswd` из `.env*` и валидация конфигурации стека
+
+**Место выполнения:** целевой сервер, Bash.
 
 ```bash
 (
@@ -1225,10 +1293,28 @@ PY
     AUTH_USER="$(printf '%s' "$CREDS" | sed -n '1p')"
     AUTH_PASS="$(printf '%s' "$CREDS" | sed -n '2p')"
 
-    printf '%s\n' "$AUTH_PASS" | htpasswd -biB "$HTPASSWD_FILE" "$AUTH_USER" >/dev/null
-    chmod 644 "$HTPASSWD_FILE"
-    unset CREDS AUTH_USER AUTH_PASS
+    HTPASSWD_TMP="$(mktemp "${HTPASSWD_FILE}.tmp.XXXXXX")"
+    trap 'rm -f "${HTPASSWD_TMP:-}"' EXIT
+    printf '%s\n' "$AUTH_PASS" | htpasswd -ciB "$HTPASSWD_TMP" "$AUTH_USER" >/dev/null
+    NGINX_GID="${NGINX_WORKER_GID:-101}"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown "0:${NGINX_GID}" "$HTPASSWD_TMP"
+    else
+        sudo -n chgrp "${NGINX_GID}" "$HTPASSWD_TMP" \
+            || { echo "STOP: не удалось назначить группу GID=${NGINX_GID} для .htpasswd (ADR-010)" >&2; exit 1; }
+    fi
+    chmod 640 "$HTPASSWD_TMP"
+    mv -f "$HTPASSWD_TMP" "$HTPASSWD_FILE"
+    trap - EXIT
+    unset CREDS AUTH_USER AUTH_PASS HTPASSWD_TMP
     HTPASSWD_STATE="generated"
+fi
+
+CF_IPS_FILE="$TARGET_DIR/data/nginx-dynamic/cloudflare-ips.conf"
+if [[ ! -f "$CF_IPS_FILE" ]]; then
+    [[ -f "$TARGET_DIR/nginx/cloudflare-ips.seed.conf" ]] \
+        || { echo "STOP: отсутствует nginx/cloudflare-ips.seed.conf для первичного bootstrap (ADR-010)" >&2; exit 1; }
+    install -m 0644 "$TARGET_DIR/nginx/cloudflare-ips.seed.conf" "$CF_IPS_FILE"
 fi
 
 APP_ENV="$APP_ENV" APP_IMAGE_TAG="${APP_IMAGE_TAG:-check}" ./scripts/cc.sh config -q
@@ -1241,17 +1327,17 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 )
 ```
 
-**Ожидаемый результат:** Файлы `.env` и `.env.<APP_ENV>` имеют права `0600` (при `initial` скопированы с исходного сервера и адаптированы под целевое окружение; при `update` сохранены без перезаписи и сверены с `.env.example`); файл `data/nginx-dynamic/.htpasswd` сгенерирован из `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` (права `0644`); команда `./scripts/cc.sh config -q` завершилась без ошибок.
+**Ожидаемый результат:** Файлы `.env` и `.env.<APP_ENV>` имеют права `0600` (при `initial` скопированы с исходного сервера и адаптированы под целевое окружение; при `update` сохранены без перезаписи и сверены с `.env.example`); файл `data/nginx-dynamic/.htpasswd` атомарно сгенерирован из `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` (права `0640`, группа worker-процесса Nginx); при отсутствии создан `data/nginx-dynamic/cloudflare-ips.conf` из seed; команда `./scripts/cc.sh config -q` завершилась без ошибок.
 
 **Условия остановки:** Отсутствие `.env*` на исходном (при `initial`) или целевом (при `update`) сервере; наличие незаполненных новых ключей из `.env.example` при `update`; отсутствие `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` при генерации `.htpasswd` или ошибка валидации `./scripts/cc.sh config -q`.
 
 ### 4.4. Доставка или сборка Docker-образов
 
-**Место выполнения:** целевой сервер, Bash.
-
 *(Выполняется строго один вариант в соответствии со значением `migration.config.yaml: images.method` — `registry`, `build` или `transfer`. Во всех вариантах инфраструктурные образы стека подтягиваются из registry через `./scripts/cc.sh pull`, чтобы к моменту cutover все образы находились в локальном кэше Docker)*
 
 #### Вариант А (`images.method = registry`)
+
+**Место выполнения:** целевой сервер, Bash.
 
 ```bash
 (
@@ -1298,6 +1384,8 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 #### Вариант Б (`images.method = build`)
 
+**Место выполнения:** целевой сервер, Bash.
+
 ```bash
 (
 set -Eeuo pipefail
@@ -1323,8 +1411,12 @@ APP_IMAGE="$(APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh c
 [[ -n "$APP_IMAGE" ]] \
     || { echo "STOP: не удалось определить образ приложения с тегом ':${APP_IMAGE_TAG}' из docker-compose.yml" >&2; exit 1; }
 
-APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh pull --ignore-buildable
 APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh build
+APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh pull --policy missing
+APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh build cert-init
+if [[ "$APP_ENV" == "production" ]]; then
+    APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh --profile tls pull --policy missing certbot
+fi
 
 while IFS= read -r img; do
     [[ -z "$img" ]] && continue
@@ -1344,6 +1436,8 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 #### Вариант В (`images.method = transfer`)
 
+**Место выполнения:** исходный сервер, Bash.
+
 ```bash
 (
 set -Eeuo pipefail
@@ -1352,11 +1446,11 @@ TARGET_DIR="⚠️**<target.project_dir>**"
 APP_ENV="⚠️**<application.app_env>**"
 IMAGES_METHOD="⚠️**<images.method>**"
 APP_IMAGE_TAG="⚠️**<images.app_tag>**"
-SOURCE_SSH_PORT="⚠️**<source.ssh.port>**"
-SOURCE_SSH_USER="⚠️**<source.ssh.user>**"
-SOURCE_SSH_HOST="⚠️**<source.ssh.host>**"
+TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
+TARGET_SSH_USER="⚠️**<target.ssh.user>**"
+TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
 
-for v in TARGET_DIR APP_ENV IMAGES_METHOD APP_IMAGE_TAG SOURCE_SSH_PORT SOURCE_SSH_USER SOURCE_SSH_HOST; do
+for v in TARGET_DIR APP_ENV IMAGES_METHOD APP_IMAGE_TAG TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST; do
     val="${!v}"
     [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
@@ -1365,44 +1459,49 @@ done
 [[ "$IMAGES_METHOD" == "transfer" ]] \
     || { echo "STOP: выбран Вариант В (transfer), но IMAGES_METHOD='$IMAGES_METHOD'" >&2; exit 25; }
 
-cd "$TARGET_DIR"
+APP_IMAGE="$(
+    ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+        "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" bash -s -- "$TARGET_DIR" "$APP_ENV" "$APP_IMAGE_TAG" <<'EOF'
+set -Eeuo pipefail
+cd "$1"
+APP_ENV="$2" APP_IMAGE_TAG="$3" ./scripts/cc.sh config --images \
+    | awk -v tag=":${3}" 'length($0) >= length(tag) && substr($0, length($0)-length(tag)+1) == tag {print; exit}'
+EOF
+)"
 
-APP_IMAGE="$(APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh config --images \
-    | awk -v tag=":${APP_IMAGE_TAG}" 'length($0) >= length(tag) && substr($0, length($0)-length(tag)+1) == tag {print; exit}')"
 [[ -n "$APP_IMAGE" ]] \
     || { echo "STOP: не удалось определить образ приложения с тегом ':${APP_IMAGE_TAG}' из docker-compose.yml" >&2; exit 1; }
+
+docker image inspect "$APP_IMAGE" >/dev/null 2>&1 \
+    || { echo "STOP: образ '$APP_IMAGE' не найден в Docker на исходном сервере" >&2; exit 1; }
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)_$$"
 SRC_ARCHIVE="/tmp/app_image_${TS}.tar.gz"
 TGT_ARCHIVE="/tmp/app_image_${TS}.tar.gz"
 
 cleanup() {
-    rm -f "${TGT_ARCHIVE:-}"
-    ssh -p "$SOURCE_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
-        "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}" "rm -f '${SRC_ARCHIVE:-}'" >/dev/null 2>&1 || true
+    rm -f "${SRC_ARCHIVE:-}"
+    ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
+        "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" "rm -f '${TGT_ARCHIVE:-}'" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-SRC_SHA256="$(
-    ssh -p "$SOURCE_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
-        "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}" bash -s -- "$APP_IMAGE" "$SRC_ARCHIVE" <<'EOF'
+docker save "$APP_IMAGE" | gzip -1 > "$SRC_ARCHIVE"
+SRC_SHA256="$(sha256sum "$SRC_ARCHIVE" | awk '{print $1}')"
+
+rsync -az -e "ssh -p $TARGET_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
+    "$SRC_ARCHIVE" "${TARGET_SSH_USER}@${TARGET_SSH_HOST}:${TGT_ARCHIVE}"
+
+APP_IMAGE_ID="$(
+    ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+        "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" bash -s -- "$TARGET_DIR" "$APP_ENV" "$APP_IMAGE_TAG" "$APP_IMAGE" "$TGT_ARCHIVE" "$SRC_SHA256" <<'EOF'
 set -Eeuo pipefail
-IMG="$1"
-ARCHIVE="$2"
-
-docker image inspect "$IMG" >/dev/null 2>&1 \
-    || { echo "STOP: образ '$IMG' не найден в Docker на исходном сервере" >&2; exit 1; }
-
-docker save "$IMG" | gzip -1 > "$ARCHIVE"
-sha256sum "$ARCHIVE" | awk '{print $1}'
-EOF
-)"
-
-[[ -n "$SRC_SHA256" ]] \
-    || { echo "STOP: не удалось экспортировать образ '$APP_IMAGE' на исходном сервере" >&2; exit 1; }
-
-rsync -az -e "ssh -p $SOURCE_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
-    "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}:${SRC_ARCHIVE}" "$TGT_ARCHIVE"
+TGT_DIR="$1"
+APP_ENV="$2"
+APP_IMAGE_TAG="$3"
+APP_IMAGE="$4"
+TGT_ARCHIVE="$5"
+SRC_SHA256="$6"
 
 TGT_SHA256="$(sha256sum "$TGT_ARCHIVE" | awk '{print $1}')"
 [[ "$SRC_SHA256" == "$TGT_SHA256" ]] \
@@ -1411,7 +1510,12 @@ TGT_SHA256="$(sha256sum "$TGT_ARCHIVE" | awk '{print $1}')"
 gunzip -c "$TGT_ARCHIVE" | docker load >/dev/null
 rm -f "$TGT_ARCHIVE"
 
-APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh pull --ignore-buildable
+cd "$TGT_DIR"
+APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh build cert-init
+APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh pull --policy missing
+if [[ "$APP_ENV" == "production" ]]; then
+    APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh --profile tls pull --policy missing certbot
+fi
 
 while IFS= read -r img; do
     [[ -z "$img" ]] && continue
@@ -1419,7 +1523,9 @@ while IFS= read -r img; do
         || { echo "STOP: обязательный образ стека '$img' отсутствует в локальном Docker" >&2; exit 1; }
 done < <(APP_ENV="$APP_ENV" APP_IMAGE_TAG="$APP_IMAGE_TAG" ./scripts/cc.sh config --images)
 
-APP_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$APP_IMAGE")"
+docker image inspect --format '{{.Id}}' "$APP_IMAGE"
+EOF
+)"
 
 STEP=4.4
 DATE_UTC="$(date -u +%FT%T)"
@@ -1439,7 +1545,7 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 ### 5.1. Перенос выбранных файловых хранилищ
 
-**Место выполнения:** целевой сервер, Bash.
+**Место выполнения:** исходный сервер, Bash.
 
 *(Выполняется по одному запуску на каждый элемент `migration.config.yaml: storage.items[id=...]`, у которого `transfer: true`, например `data/ssl` или `data/letsencrypt`. При отсутствии элементов с `transfer: true` шаг пропускается)*
 
@@ -1449,15 +1555,15 @@ set -Eeuo pipefail
 
 TARGET_DIR="⚠️**<target.project_dir>**"
 SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
-SOURCE_SSH_PORT="⚠️**<source.ssh.port>**"
-SOURCE_SSH_USER="⚠️**<source.ssh.user>**"
-SOURCE_SSH_HOST="⚠️**<source.ssh.host>**"
+TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
+TARGET_SSH_USER="⚠️**<target.ssh.user>**"
+TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
 ITEM_ID="⚠️**<storage.items[id=...].id>**"
 ITEM_TRANSFER="⚠️**<storage.items[id=...].transfer>**"
 SRC_REL_PATH="⚠️**<storage.items[id=...].source_relative_path>**"
 TGT_REL_PATH="⚠️**<storage.items[id=...].target_relative_path>**"
 
-for v in TARGET_DIR SOURCE_PROJECT_DIR SOURCE_SSH_PORT SOURCE_SSH_USER SOURCE_SSH_HOST ITEM_ID ITEM_TRANSFER SRC_REL_PATH TGT_REL_PATH; do
+for v in TARGET_DIR SOURCE_PROJECT_DIR TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST ITEM_ID ITEM_TRANSFER SRC_REL_PATH TGT_REL_PATH; do
     val="${!v}"
     [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
@@ -1491,38 +1597,51 @@ done
 SRC_FULL_PATH="${SOURCE_PROJECT_DIR}/${SRC_REL_PATH}"
 TGT_FULL_PATH="${TARGET_DIR}/${TGT_REL_PATH}"
 
-if [[ -d "$TGT_FULL_PATH" ]]; then
-    if ! EXISTING_FILES="$(find "$TGT_FULL_PATH" -mindepth 1 -printf '%TY-%Tm-%Td %TH:%TM:%.2TS %TZ\t%y\t%s\t%P\n' 2>/dev/null)"; then
+SRC_TAR=(tar)
+if [[ "${EUID}" -ne 0 ]]; then
+    SRC_TAR=(sudo -n tar)
+    sudo -n test -d "$SRC_FULL_PATH" \
+        || { echo "STOP: исходный каталог '$SRC_FULL_PATH' отсутствует или недоступен через sudo -n" >&2; exit 1; }
+else
+    [[ -d "$SRC_FULL_PATH" ]] \
+        || { echo "STOP: исходный каталог '$SRC_FULL_PATH' отсутствует" >&2; exit 1; }
+fi
+
+ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+    "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" bash -s -- "$TGT_FULL_PATH" "$ITEM_ID" <<'EOF'
+set -Eeuo pipefail
+TGT_PATH="$1"
+ITEM_ID="$2"
+
+if [[ -d "$TGT_PATH" ]]; then
+    if ! EXISTING_FILES="$(find "$TGT_PATH" -mindepth 1 -printf '%TY-%Tm-%Td %TH:%TM:%.2TS %TZ\t%y\t%s\t%P\n' 2>/dev/null)"; then
         if [[ "${EUID}" -ne 0 ]]; then
-            EXISTING_FILES="$(sudo -n find "$TGT_FULL_PATH" -mindepth 1 -printf '%TY-%Tm-%Td %TH:%TM:%.2TS %TZ\t%y\t%s\t%P\n')"
+            EXISTING_FILES="$(sudo -n find "$TGT_PATH" -mindepth 1 -printf '%TY-%Tm-%Td %TH:%TM:%.2TS %TZ\t%y\t%s\t%P\n')"
         else
-            echo "STOP: не удалось просканировать целевой каталог '$TGT_FULL_PATH'" >&2
+            echo "STOP: не удалось просканировать целевой каталог '$TGT_PATH'" >&2
             exit 1
         fi
     fi
 
     if [[ -n "$EXISTING_FILES" ]]; then
-        echo "STOP: целевой каталог '$TGT_FULL_PATH' не пуст. Перенос элемента '${ITEM_ID}' остановлен во избежание перезаписи:" >&2
+        echo "STOP: целевой каталог '$TGT_PATH' не пуст. Перенос элемента '${ITEM_ID}' остановлен во избежание перезаписи:" >&2
         printf '%s\n' "$EXISTING_FILES" >&2
-        echo "Проверьте даты файлов. Для выполнения переноса предварительно очистите '$TGT_FULL_PATH' вручную либо установите transfer=false." >&2
+        echo "Проверьте даты файлов. Для выполнения переноса предварительно очистите '$TGT_PATH' вручную либо установите transfer=false." >&2
         exit 1
     fi
-elif [[ -e "$TGT_FULL_PATH" ]]; then
-    echo "STOP: целевой путь '$TGT_FULL_PATH' существует и не является каталогом" >&2
+elif [[ -e "$TGT_PATH" ]]; then
+    echo "STOP: целевой путь '$TGT_PATH' существует и не является каталогом" >&2
     exit 1
 fi
 
-mkdir -p "$TGT_FULL_PATH"
+mkdir -p "$TGT_PATH"
+EOF
 
-RSYNC_CMD=(rsync)
-if [[ "${EUID}" -ne 0 ]]; then
-    RSYNC_CMD=(sudo -n rsync)
-fi
-
-"${RSYNC_CMD[@]}" -aHAX --numeric-ids --delete \
-    --rsync-path="sudo -n rsync" \
-    -e "ssh -p $SOURCE_SSH_PORT -o BatchMode=yes -o ConnectTimeout=10" \
-    "${SOURCE_SSH_USER}@${SOURCE_SSH_HOST}:${SRC_FULL_PATH}/" "${TGT_FULL_PATH}/"
+TGT_QUOTED="$(printf '%q' "$TGT_FULL_PATH")"
+"${SRC_TAR[@]}" --numeric-owner -cpf - -C "$SRC_FULL_PATH" . \
+    | ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
+        "${TARGET_SSH_USER}@${TARGET_SSH_HOST}" \
+        "sh -c 'if [ \"\$(id -u)\" -eq 0 ]; then exec tar --numeric-owner -xpf - -C \"\$1\"; else exec sudo -n tar --numeric-owner -xpf - -C \"\$1\"; fi' _ ${TGT_QUOTED}"
 
 STEP=5.1
 DATE_UTC="$(date -u +%FT%T)"
@@ -1534,7 +1653,7 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 **Ожидаемый результат:** Содержимое каталога `source_relative_path` перенесено в `target_relative_path` с сохранением владельцев и прав доступа (`UID`/`GID`, режимы `0600`/`0644`).
 
-**Условия остановки:** Неподставленные или некорректные параметры пути, наличие существующих файлов в целевом каталоге (выводится список с датами модификации), ошибка SSH-доступа или отсутствие прав чтения/записи через `sudo -n rsync`.
+**Условия остановки:** Неподставленные или некорректные параметры пути, отсутствие исходного каталога, наличие существующих файлов в целевом каталоге (выводится список с датами модификации), ошибка SSH-доступа или отсутствие прав чтения/записи через `sudo -n tar`.
 
 ## 6. Применение миграций и запуск стека
 
@@ -1544,6 +1663,8 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 **Место выполнения:** целевой сервер, Bash.
 
+*(При `migration.mode = initial` и `app_env = production`: убедитесь, что в Cloudflare настроены проксированные A-записи для `<CANONICAL_HOST>` и `www.<CANONICAL_HOST>`, а на время первичного выпуска сертификата Let's Encrypt режим SSL/TLS установлен в `Full` либо отключён HTTPS-редирект для `/.well-known/acme-challenge/*`, чтобы избежать ошибки 526 на самоподписанном `cert-init`; после успешного завершения `deploy.sh` переключите режим в `Full (Strict)`)*
+
 ```bash
 (
 set -Eeuo pipefail
@@ -1552,9 +1673,10 @@ TARGET_DIR="⚠️**<target.project_dir>**"
 MIGRATION_MODE="⚠️**<migration.mode>**"
 APP_ENV="⚠️**<application.app_env>**"
 APP_IMAGE_TAG="⚠️**<images.app_tag>**"
+IMAGES_METHOD="⚠️**<images.method>**"
 ENABLE_WORKER="⚠️**<application.enable_worker>**"
 
-for v in TARGET_DIR MIGRATION_MODE APP_ENV APP_IMAGE_TAG ENABLE_WORKER; do
+for v in TARGET_DIR MIGRATION_MODE APP_ENV APP_IMAGE_TAG IMAGES_METHOD ENABLE_WORKER; do
     val="${!v}"
     [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
@@ -1563,6 +1685,11 @@ done
 case "$MIGRATION_MODE" in
     initial|update) ;;
     *) echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2; exit 25 ;;
+esac
+
+case "$IMAGES_METHOD" in
+    registry|build|transfer) ;;
+    *) echo "STOP: IMAGES_METHOD='$IMAGES_METHOD', ожидается 'registry', 'build' или 'transfer'" >&2; exit 25 ;;
 esac
 
 case "$ENABLE_WORKER" in
@@ -1611,9 +1738,13 @@ if [[ -f nginx/nginx.conf ]] && "${clean_env_cmd[@]}" APP_ENV="$APP_ENV" APP_IMA
     HOST_NGINX_HASH="$(sha256sum nginx/nginx.conf | awk '{print $1}')"
 fi
 
+BUILD_LOCAL_FLAG="0"
+[[ "$IMAGES_METHOD" == "build" ]] && BUILD_LOCAL_FLAG="1"
+
 "${clean_env_cmd[@]}" \
     APP_ENV="$APP_ENV" \
     APP_IMAGE_TAG="$APP_IMAGE_TAG" \
+    BUILD_LOCAL="$BUILD_LOCAL_FLAG" \
     ENABLE_WORKER="$ENABLE_WORKER" \
     ./scripts/deploy.sh
 
@@ -1687,6 +1818,8 @@ cc_cmd=(
     -u DB_NAME -u DB_USER -u DB_PASSWORD -u DB_HOST
     -u POSTGRES_DB -u POSTGRES_USER -u POSTGRES_PASSWORD
     -u COMPOSE_ENV_FILES -u COMPOSE_FILE
+    APP_ENV="$APP_ENV"
+    APP_IMAGE_TAG="$APP_IMAGE_TAG"
     ./scripts/cc.sh
 )
 
@@ -1713,16 +1846,15 @@ else
     worker_state="disabled"
 fi
 
-for job in migrate-job static-publish-job cert-init; do
-    cid="$("${cc_cmd[@]}" ps -a -q "$job" | head -n 1)"
-    [[ -n "$cid" ]] || { echo "STOP: не найден контейнер одноразового джоба '$job'" >&2; exit 1; }
-    status="$(docker inspect --format '{{.State.Status}}' "$cid")"
-    exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$cid")"
-    [[ "$status" == "exited" && "$exit_code" == "0" ]] \
-        || { echo "STOP: джоб '$job' завершился неуспешно (status=$status, exit_code=$exit_code)" >&2; exit 1; }
-done
+# Одноразовые джобы в deploy.sh запускаются с --rm, поэтому проверяем их артефакты/постусловия.
+"${cc_cmd[@]}" exec -T web python manage.py migrate --check >/dev/null \
+    || { echo "STOP: обнаружены неприменённые миграции БД (migrate-job)" >&2; exit 1; }
+"${cc_cmd[@]}" exec -T nginx test -s /app/staticfiles/staticfiles.json \
+    || { echo "STOP: отсутствует манифест статики /app/staticfiles/staticfiles.json (static-publish-job)" >&2; exit 1; }
+"${cc_cmd[@]}" exec -T nginx sh -c 'test -s /etc/nginx/ssl/fullchain.pem && test -s /etc/nginx/ssl/privkey.pem' \
+    || { echo "STOP: отсутствуют TLS-файлы в /etc/nginx/ssl/ (cert-init/certbot)" >&2; exit 1; }
 
-LOG_SERVICES=(migrate-job static-publish-job cert-init web nginx)
+LOG_SERVICES=(web nginx)
 if [[ "$ENABLE_WORKER" == "1" ]]; then
     LOG_SERVICES+=(worker)
 fi
@@ -1737,9 +1869,9 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 )
 ```
 
-**Ожидаемый результат:** Сервисы `postgres`, `redis`, `web`, `nginx` (и `worker` при `ENABLE_WORKER=1`) находятся в статусе `running` и `healthy`; одноразовые контейнеры `migrate-job`, `static-publish-job` и `cert-init` завершились с кодом `0`; выведены хвостовые логи ключевых сервисов.
+**Ожидаемый результат:** Сервисы `postgres`, `redis`, `web`, `nginx` (и `worker` при `ENABLE_WORKER=1`) находятся в статусе `running` и `healthy`; подтверждены постусловия одноразовых джобов (нет неприменённых миграций, присутствует `staticfiles.json` и TLS-файлы в `/etc/nginx/ssl/`); выведены хвостовые логи ключевых сервисов.
 
-**Условия остановки:** Неподставленные параметры, отсутствие контейнера, статус отличного от `healthy` у долгоживущего сервиса или ненулевой код выхода / отсутствие одноразового джоба.
+**Условия остановки:** Неподставленные параметры, отсутствие контейнера, статус отличного от `healthy` у долгоживущего сервиса либо невыполнение постусловий миграций, статики или TLS.
 
 ### 7.2. Проверка внутреннего `/healthz/` и smoke-теста периметра Nginx/TLS
 
@@ -1795,11 +1927,13 @@ cc_cmd=(
     -u DB_NAME -u DB_USER -u DB_PASSWORD -u DB_HOST
     -u POSTGRES_DB -u POSTGRES_USER -u POSTGRES_PASSWORD
     -u COMPOSE_ENV_FILES -u COMPOSE_FILE
+    APP_ENV="$APP_ENV"
+    APP_IMAGE_TAG="$APP_IMAGE_TAG"
     ./scripts/cc.sh
 )
 
 # 1. Внутренняя проверка /healthz/ внутри контейнера web (без редиректов и внешнего прокси)
-"${cc_cmd[@]}" exec -T web python - "[http://127.0.0.1:8000/healthz/](http://127.0.0.1:8000/healthz/)" "$CANONICAL_HOST" <<'PY'
+"${cc_cmd[@]}" exec -T web python - "http://127.0.0.1:8000/healthz/" "$CANONICAL_HOST" <<'PY'
 import sys
 import urllib.error
 import urllib.request
@@ -1840,10 +1974,50 @@ code="$(curl -ksS --resolve "${CANONICAL_HOST}:443:127.0.0.1" -o /dev/null -w '%
 [[ "$code" == "404" ]] \
     || { echo "STOP 7.2: внешний /exchange/ вернул $code (ожидалось 404)" >&2; exit 71; }
 
-code="$(curl -ksS --resolve "${CANONICAL_HOST}:443:127.0.0.1" -o /dev/null -w '%{http_code}' \
+hdrs="$(curl -ksS -D - --resolve "${CANONICAL_HOST}:443:127.0.0.1" -o /dev/null \
     "https://${CANONICAL_HOST}/admin/")"
+code="$(printf '%s\n' "$hdrs" | awk 'NR==1 {sub(/\r$/, ""); print $2}')"
 [[ "$code" == "401" ]] \
-    || { echo "STOP 7.2: /admin/ вернул $code (ожидалось 401 Basic Auth)" >&2; exit 71; }
+    || { echo "STOP 7.2: /admin/ без credentials вернул $code (ожидалось 401 Basic Auth)" >&2; exit 71; }
+printf '%s\n' "$hdrs" | grep -qi '^www-authenticate:.*basic' \
+    || { echo "STOP 7.2: /admin/ вернул 401 без WWW-Authenticate: Basic (ADR-010)" >&2; exit 71; }
+
+BASIC_CREDS="$(
+    python3 - "$APP_ENV" <<'PY'
+import re, sys
+from pathlib import Path
+
+app_env = sys.argv[1]
+kv_re = re.compile(r'^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
+env_map: dict[str, str] = {}
+for fname in (".env", f".env.{app_env}"):
+    p = Path(fname)
+    if not p.is_file():
+        continue
+    for line in p.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = kv_re.match(s)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2).strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        env_map[k] = v
+u, pw = env_map.get("BASIC_AUTH_USER", ""), env_map.get("BASIC_AUTH_PASSWORD", "")
+if not u or not pw:
+    sys.exit(2)
+esc = f"{u}:{pw}".replace("\\", "\\\\").replace('"', '\\"')
+sys.stdout.write(f'user = "{esc}"\n')
+PY
+)" || { echo "STOP 7.2: не найдены BASIC_AUTH_USER/BASIC_AUTH_PASSWORD для проверки /admin/ (ADR-010)" >&2; exit 71; }
+
+code="$(printf '%s' "$BASIC_CREDS" | curl -ksS -K - --resolve "${CANONICAL_HOST}:443:127.0.0.1" -o /dev/null -w '%{http_code}' \
+    "https://${CANONICAL_HOST}/admin/")"
+unset BASIC_CREDS
+[[ "$code" =~ ^(200|301|302)$ ]] \
+    || { echo "STOP 7.2: /admin/ с валидными credentials вернул $code (ожидалось 200/301/302; проверьте права .htpasswd)" >&2; exit 71; }
 
 code="$(curl -ksS --resolve "${CANONICAL_HOST}:443:127.0.0.1" -o /dev/null -w '%{http_code}' \
     "https://${CANONICAL_HOST}/")"
@@ -1854,7 +2028,7 @@ code="$(curl -ksS --resolve "${CANONICAL_HOST}:443:127.0.0.1" -o /dev/null -w '%
 STEP=7.2
 DATE_UTC="$(date -u +%FT%T)"
 NOTE="Внутренний /healthz/ и периметр Nginx/TLS проверены"
-OUTPUT="host=${CANONICAL_HOST}; healthz=200(in)/404(out); exchange=404; admin=401"
+OUTPUT="host=${CANONICAL_HOST}; healthz=200(in)/404(out); exchange=404; admin=401+auth_ok"
 printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 )
 ```
@@ -1905,6 +2079,8 @@ cc_cmd=(
     -u DB_NAME -u DB_USER -u DB_PASSWORD -u DB_HOST
     -u POSTGRES_DB -u POSTGRES_USER -u POSTGRES_PASSWORD
     -u COMPOSE_ENV_FILES -u COMPOSE_FILE
+    APP_ENV="$APP_ENV"
+    APP_IMAGE_TAG="$APP_IMAGE_TAG"
     ./scripts/cc.sh
 )
 
@@ -2005,7 +2181,7 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 set -Eeuo pipefail
 
 TARGET_DIR="⚠️**<target.project_dir>**"
-ROLLBACK_DIR="⚠️**<target.rollback_dir>**"
+ROLLBACK_DIR="⚠️**<journal.rollback_dir>**"
 MIGRATION_MODE="⚠️**<migration.mode>**"
 APP_ENV="⚠️**<application.app_env>**"
 ENABLE_WORKER="⚠️**<application.enable_worker>**"

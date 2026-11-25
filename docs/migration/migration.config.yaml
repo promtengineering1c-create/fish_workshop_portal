@@ -57,12 +57,12 @@ migration:
 journal:
   # [MUST] Абсолютный путь к журналу выполнения на целевом сервере.
   # Не должен находиться внутри target.project_dir.
-  path: null
+  path: /srv/deploy_tmp/fish_workshop_portal/migration.log
 
   # [IF migration.mode = update] Абсолютный каталог артефактов отката.
   # Не должен находиться внутри target.project_dir.
   # [IF migration.mode = initial] допускается null.
-  rollback_dir: null
+  rollback_dir: /srv/backups/fish_workshop_portal/rollback
 
 # =============================================================================
 # 3. СЕРВЕРЫ
@@ -79,12 +79,12 @@ source:
   # [MUST] Абсолютный путь к существующему каталогу проекта на исходном
   # сервере. От него отсчитываются storage.items[*].source_relative_path
   # и secrets.source_path (если задан абсолютным путём).
-  project_dir: /home/kali/ai-system/fish_workshop_portal
+  project_dir: /home/kali/projects/fish_workshop_portal
 
 target:
   ssh:
     # [MUST] Адрес production-сервера для SSH.
-    host: 95.181.154.236 (uralsfish.ru)
+    host: uralsfish.ru # 95.181.154.236
     # [MUST] SSH-порт, целое число.
     port: 22
     # [MUST] Учётная запись SSH на целевом сервере.
@@ -107,10 +107,10 @@ code_delivery:
   method: remote_git
 
   # [IF method = remote_git] URL удалённого репозитория без пароля и токена.
-  remote_url: https://github.com/promtengineering1c-create/ai_system/tree/main/fish_workshop_portal
+  remote_url: https://github.com/promtengineering1c-create/fish_workshop_portal.git
 
   # [IF method ∈ {remote_git, local_git}] Ветка, тег или полный SHA коммита.
-  ref: 
+  ref: 0.1.0
 
 # =============================================================================
 # 5. ФАЙЛОВЫЕ ХРАНИЛИЩА
@@ -144,10 +144,10 @@ storage:
 # =============================================================================
 application:
 # [MUST] Окружение: development | staging | production.
-  app_env: null
+  app_env: production
 
   # [MUST] Включать worker в запуск: 1 — да, 0 — нет.
-  enable_worker: null  
+  enable_worker: 0  
 
 # =============================================================================
 # 7. ОБРАЗЫ
@@ -157,9 +157,9 @@ images:
   #   registry — pull из container registry;
   #   build    — сборка на целевом сервере;
   #   transfer — docker save/load с исходного сервера.
-  method: null
+  method: build
 
   # [MUST] Тег образа приложения.
   # Имя образа резолвится из docker-compose.yml по суффиксу :<app_tag>.
-  app_tag: null
+  app_tag: 0.1.0
 
