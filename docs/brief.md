@@ -15,7 +15,7 @@ sudo apt install gh -y
 
 gh auth login
 
-gh repo create ai_system --public --source=. --remote=origin --push
+gh repo create <depository_name> --public --source=. --remote=origin --push
 
 # Создание сетевой папки 
 sudo apt update && sudo apt install samba -y
@@ -145,3 +145,5 @@ APP_ENV=development ./scripts/cc.sh exec web python manage.py createsuperuser
 или ./scripts/cc.sh up -d --wait
 
 ./scripts/cc.sh stop
+
+# Deploy mode:ininitial

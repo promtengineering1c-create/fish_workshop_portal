@@ -59,9 +59,9 @@ YAML содержит входные параметры и заранее выб
 Подключение к исходному серверу по параметрам `migration.config:source.ssh.*`.
 
 ```bash
-SOURCE_SSH_PORT=⚠️**<source.ssh.port>**
-SOURCE_SSH_USER=⚠️**<source.ssh.user>**
-SOURCE_SSH_HOST=⚠️**<source.ssh.host>**
+SOURCE_SSH_PORT=22
+SOURCE_SSH_USER=kali
+SOURCE_SSH_HOST=192.168.22.136
 
 ssh -p "$SOURCE_SSH_PORT" "$SOURCE_SSH_USER"@"$SOURCE_SSH_HOST"
 ```
@@ -95,9 +95,9 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 Подключение к целевому серверу по параметрам `migration.config:target.ssh.*`.
 
 ```bash
-TARGET_SSH_PORT=⚠️**<target.ssh.port>**
-TARGET_SSH_USER=⚠️**<target.ssh.user>**
-TARGET_SSH_HOST=⚠️**<target.ssh.host>**
+TARGET_SSH_PORT=22
+TARGET_SSH_USER=uralsfish
+TARGET_SSH_HOST=uralsfish.ru
 
 ssh -p "$TARGET_SSH_PORT" "$TARGET_SSH_USER"@"$TARGET_SSH_HOST"
 ```
@@ -124,12 +124,40 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 **Ожидаемый результат:** получен фактический вывод имени хоста; вывод `id -un` соответствует `target.ssh.user`.
 
+### 2.4.1. Проверка неинтерактивного доступа `sudo -n` на целевом сервере
+
+**Место выполнения:** целевой сервер, Bash.
+
+```bash
+(
+set -Eeuo pipefail
+
+if [[ "${EUID}" -eq 0 ]]; then
+    SUDO_MODE="root"
+else
+    command -v sudo >/dev/null 2>&1 || { echo "STOP: утилита sudo не найдена для пользователя $(id -un)" >&2; exit 1; }
+    sudo -n true >/dev/null 2>&1 || { echo "STOP: не настроен NOPASSWD sudo для пользователя $(id -un); настройте правило в /etc/sudoers.d/ и повторите шаг" >&2; exit 1; }
+    SUDO_MODE="nopasswd"
+fi
+
+STEP=2.4.1
+DATE_UTC="$(date -u +%FT%T)"
+NOTE="Неинтерактивный доступ sudo на целевом сервере подтверждён"
+OUTPUT="user=$(id -un); sudo=${SUDO_MODE}"
+printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
+)
+```
+
+**Ожидаемый результат:** Пользователь работает от `root` либо имеет рабочий неинтерактивный `sudo -n` (`NOPASSWD`) для выполнения привилегированных проверок и операций без запроса пароля.
+
+**Условия остановки:** Отсутствует утилита `sudo` либо `sudo -n true` завершается с ошибкой (требуется ввод пароля или отсутствует право `sudo`).
+
 ### 2.5. Проверка директории исходного проекта
 
 **Место выполнения:** исходный сервер, Bash.
 
 ```bash
-SOURCE_PROJECT_DIR=⚠️**<source.project_dir>**
+SOURCE_PROJECT_DIR=/home/kali/projects/fish_workshop_portal
 
 cd "$SOURCE_PROJECT_DIR" && \
 ls -la docker-compose.yml
@@ -202,10 +230,10 @@ require_value() {
 
 set -Eeuo pipefail
 
-TARGET_DIR="⚠️**<target.project_dir>**"
-ROLLBACK_DIR="⚠️**<journal.rollback_dir>**"
-JOURNAL="⚠️**<journal.path>**"
-MIGRATION_MODE="⚠️**<migration.mode>**"
+TARGET_DIR="/srv/apps/fish_workshop_portal"
+ROLLBACK_DIR="/srv/backups/fish_workshop_portal/rollback"
+JOURNAL="/srv/deploy_tmp/fish_workshop_portal/migration.log"
+MIGRATION_MODE="initial"
 
 require_value TARGET_DIR "$TARGET_DIR" path || exit 26
 require_value JOURNAL "$JOURNAL" path || exit 26
@@ -226,9 +254,9 @@ esac
 TARGET_DIR="${TARGET_DIR%/}"
 
 DIRS_TO_CREATE=("$TARGET_DIR" "$(dirname -- "$JOURNAL")")
-+[[ "$MIGRATION_MODE" == "update" ]] && DIRS_TO_CREATE+=("$ROLLBACK_DIR")
-+
-+for d in "${DIRS_TO_CREATE[@]}"; do
+[[ "$MIGRATION_MODE" == "update" ]] && DIRS_TO_CREATE+=("$ROLLBACK_DIR")
+
+for d in "${DIRS_TO_CREATE[@]}"; do
     mkdir -p "$d" 2>/dev/null \
         || { echo "STOP: нет прав на создание каталога '$d' для пользователя $(id -un); создайте родительский каталог с правами записи или смените путь в YAML" >&2; exit 1; }
     [[ -w "$d" ]] \
@@ -253,7 +281,7 @@ case "$MIGRATION_MODE" in
         ;;
 esac
 )
-TARGET_DIR="⚠️**<target.project_dir>**"
+TARGET_DIR="/srv/apps/fish_workshop_portal"
 
 cd "$TARGET_DIR"
 pwd
