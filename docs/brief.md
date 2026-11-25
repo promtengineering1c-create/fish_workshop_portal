@@ -147,3 +147,4 @@ APP_ENV=development ./scripts/cc.sh exec web python manage.py createsuperuser
 ./scripts/cc.sh stop
 
 # Deploy mode:ininitial
+

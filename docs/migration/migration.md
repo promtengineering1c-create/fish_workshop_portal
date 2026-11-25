@@ -195,6 +195,73 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 **Ожидаемый результат:** Установлены Docker и плагин `docker compose` версии `>= 2.24` (ADR-011); зафиксировано наличие `docker-rollout` (для бесшовного обновления `start-first` либо отсутствие плагина — в этом случае на шаге выкатки допускается fallback `up -d` с окном недоступности 5–15 с).
 
+### 2.6.1. Проверка установки `ipset` на целевом сервере
+
+**Место выполнения:** целевой сервер, Bash.
+
+*(Выполняется при `migration.config.yaml: migration.mode` — `initial` для окружения `production` или при `REQUIRE_FIREWALL=1`. При `update` и в `development`/`staging` шаг пропускается)*
+
+```bash
+(
+set -Eeuo pipefail
+
+MIGRATION_MODE="⚠️**<migration.mode>**"
+APP_ENV="⚠️**<application.app_env>**"
+REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
+
+for v in MIGRATION_MODE APP_ENV; do
+    val="${!v}"
+    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
+        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
+done
+
+case "$MIGRATION_MODE" in
+    initial) ;;
+    update)
+        echo "2.6.1: mode=update — проверка установки ipset пропускается."
+        exit 0
+        ;;
+    *)
+        echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2
+        exit 25
+        ;;
+esac
+
+if [[ -z "$REQUIRE_FIREWALL" ]]; then
+    [[ "$APP_ENV" == "production" ]] && REQUIRE_FIREWALL="1" || REQUIRE_FIREWALL="0"
+fi
+
+if [[ "$REQUIRE_FIREWALL" != "1" ]]; then
+    echo "2.6.1: APP_ENV=$APP_ENV, REQUIRE_FIREWALL=$REQUIRE_FIREWALL — проверка установки ipset пропускается."
+    exit 0
+fi
+
+IPSET_BIN=""
+if command -v ipset >/dev/null 2>&1; then
+    IPSET_BIN="$(command -v ipset)"
+elif [[ -x /usr/sbin/ipset ]]; then
+    IPSET_BIN="/usr/sbin/ipset"
+elif [[ -x /sbin/ipset ]]; then
+    IPSET_BIN="/sbin/ipset"
+else
+    echo "STOP: утилита ipset не установлена (установите пакет ipset: sudo apt-get update && sudo apt-get install -y ipset)" >&2
+    exit 1
+fi
+
+IPSET_VER="$("$IPSET_BIN" --version 2>&1 | head -n 1 | tr -d '\r')"
+
+STEP=2.6.1
+DATE_UTC="$(date -u %FT%T)"
+NOTE="Утилита ipset установлена"
+OUTPUT="bin=${IPSET_BIN}; ver=${IPSET_VER}"
+printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
+)
+```
+
+**Ожидаемый результат:** Утилита `ipset` установлена на целевом сервере и доступна для работы с наборами IP-адресов (`ADR-010`).
+
+**Условия остановки:** Неподставленные параметры либо отсутствие бинарного файла `ipset`.
+
 ### 2.7. Подготовка целевой директории
 
 **Место выполнения:** целевой сервер, Bash.
@@ -299,8 +366,8 @@ pwd
 (
 set -Eeuo pipefail
 
-MIGRATION_MODE="⚠️**<migration.mode>**"
-APP_ENV="⚠️**<application.app_env>**"
+MIGRATION_MODE="initial"
+APP_ENV="production"
 REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
 
 for v in MIGRATION_MODE APP_ENV; do
