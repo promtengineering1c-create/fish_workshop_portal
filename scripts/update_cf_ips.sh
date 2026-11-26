@@ -16,6 +16,14 @@ set -Eeuo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export APP_ENV="${APP_ENV:-production}"
 
+BOOTSTRAP_MODE=0
+for arg in "$@"; do
+  case "$arg" in
+    --bootstrap) BOOTSTRAP_MODE=1 ;;
+    *) printf '[update_cf_ips] FATAL: unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CC="${REPO_ROOT}/scripts/cc.sh"
@@ -149,11 +157,14 @@ if [[ -f "${OUT}" ]] && cmp -s "${CANDIDATE}" "${OUT}" && cmp -s "${ACTIVE_V4}" 
 fi
 
 # Проверка статуса nginx: отличаем ошибку cc.sh ps от пустого вывода.
-if ! running_svcs="$("${CC}" ps --status running --services)"; then
-  die "cc.sh ps failed; state unchanged"
-fi
-if ! printf '%s\n' "${running_svcs}" | grep -qx 'nginx'; then
-  die "nginx is not running; update not applied (will complete on next deploy)"
+if [[ "${BOOTSTRAP_MODE}" -eq 0 ]]; then
+  # Проверка статуса nginx: отличаем ошибку cc.sh ps от пустого вывода.
+  if ! running_svcs="$("${CC}" ps --status running --services)"; then
+    die "cc.sh ps failed; state unchanged"
+  fi
+  if ! printf '%s\n' "${running_svcs}" | grep -qx 'nginx'; then
+    die "nginx is not running; update not applied (will complete on next deploy)"
+  fi
 fi
 
 apply_ipset() {
@@ -236,6 +247,13 @@ HAS_PREV=0
 if [[ -f "${OUT}" ]]; then
   cp "${OUT}" "${PREV_OUT}"
   HAS_PREV=1
+fi
+
+if [[ "${BOOTSTRAP_MODE}" -eq 1 ]]; then
+  atomic_install_fsync "${CANDIDATE}" "${OUT}"
+  apply_ipset "${NEW_V4}"
+  log "bootstrap complete: cloudflare-ips.conf and ipset ${IPSET_NAME} initialized (nginx not running)"
+  exit 0
 fi
 
 # 1. Сузить ingress до пересечения активного и нового IPv4-списков.

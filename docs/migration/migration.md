@@ -205,8 +205,9 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 (
 set -Eeuo pipefail
 
-MIGRATION_MODE="⚠️**<migration.mode>**"
-APP_ENV="⚠️**<application.app_env>**"
+MIGRATION_MODE="initial"
+APP_ENV="production"
+
 REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
 
 for v in MIGRATION_MODE APP_ENV; do
@@ -248,10 +249,18 @@ else
     exit 1
 fi
 
-IPSET_VER="$("$IPSET_BIN" --version 2>&1 | head -n 1 | tr -d '\r')"
+IPSET_CMD=("$IPSET_BIN")
+if [[ "${EUID}" -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || { echo "STOP: требуется root или sudo для проверки ipset" >&2; exit 1; }
+    IPSET_CMD=(sudo -n "$IPSET_BIN")
+fi
+
+IPSET_RAW="$("${IPSET_CMD[@]}" -v 2>&1)" \
+    || { echo "STOP: '${IPSET_CMD[*]} -v' завершилась с ошибкой: $IPSET_RAW" >&2; exit 1; }
+IPSET_VER="$(printf '%s\n' "$IPSET_RAW" | sed -n '1p' | tr -d '\r')"
 
 STEP=2.6.1
-DATE_UTC="$(date -u %FT%T)"
+DATE_UTC="$(date -u +%FT%T)"
 NOTE="Утилита ipset установлена"
 OUTPUT="bin=${IPSET_BIN}; ver=${IPSET_VER}"
 printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
@@ -355,6 +364,160 @@ pwd
 ```
 
 **Ожидаемый результат:** Директории проекта, bind-маунтов (`data/nginx-dynamic`, `data/ssl`, `data/letsencrypt`), отката и каталога журнала созданы; внешний том `pgdata` создан (при `initial`) или подтверждён (при `update`). Осуществлён переход в целевую директорию, вывод `pwd` совпадает с `target.project_dir`.
+
+### 2.7.1. Первичная инициализация `ipset` `cf_ips_v4` и цепочки `DOCKER-USER`
+
+**Место выполнения:** целевой сервер, Bash.
+
+*(Выполняется при `migration.config.yaml: migration.mode` — `initial` для окружения `production` или при `REQUIRE_FIREWALL=1`. При `update` и в `development`/`staging` шаг пропускается)*
+
+```bash
+(
+set -Eeuo pipefail
+
+MIGRATION_MODE="initial"
+APP_ENV="production"
+
+REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
+
+for v in MIGRATION_MODE APP_ENV; do
+    val="${!v}"
+    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
+        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
+done
+
+case "$MIGRATION_MODE" in
+    initial) ;;
+    update)
+        echo "2.7.1: mode=update — первичная инициализация файрвола пропускается."
+        exit 0
+        ;;
+    *)
+        echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2
+        exit 25
+        ;;
+esac
+
+if [[ -z "$REQUIRE_FIREWALL" ]]; then
+    [[ "$APP_ENV" == "production" ]] && REQUIRE_FIREWALL="1" || REQUIRE_FIREWALL="0"
+fi
+
+if [[ "$REQUIRE_FIREWALL" != "1" ]]; then
+    echo "2.7.1: APP_ENV=$APP_ENV, REQUIRE_FIREWALL=$REQUIRE_FIREWALL — инициализация DOCKER-USER пропускается."
+    exit 0
+fi
+
+find_bin() {
+    local name="$1"
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+    elif [[ -x "/usr/sbin/$name" ]]; then
+        printf '/usr/sbin/%s\n' "$name"
+    elif [[ -x "/sbin/$name" ]]; then
+        printf '/sbin/%s\n' "$name"
+    else
+        return 1
+    fi
+}
+
+IPT_BIN="$(find_bin iptables)" || { echo "STOP: утилита iptables не найдена (ADR-010)" >&2; exit 1; }
+IPSET_BIN="$(find_bin ipset)" || { echo "STOP: утилита ipset не найдена (ADR-010)" >&2; exit 1; }
+
+IPT_CMD=("$IPT_BIN")
+IPSET_CMD=("$IPSET_BIN")
+
+if [[ "${EUID}" -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || { echo "STOP: утилита sudo не найдена" >&2; exit 1; }
+    sudo -n true >/dev/null 2>&1 || { echo "STOP: требуется NOPASSWD sudo для настройки ipset/iptables" >&2; exit 1; }
+    IPT_CMD=(sudo -n "$IPT_BIN")
+    IPSET_CMD=(sudo -n "$IPSET_BIN")
+fi
+
+TMP_V4="$(mktemp)"
+TMP_SET="cf_ips_v4_init_$$"
+trap 'rm -f "${TMP_V4:-}"; "${IPSET_CMD[@]}" destroy "${TMP_SET}" >/dev/null 2>&1 || true' EXIT
+
+curl -fsS --proto '=https' --connect-timeout 10 --max-time 30 \
+    "https://www.cloudflare.com/ips-v4" -o "$TMP_V4" \
+    || { echo "STOP: не удалось загрузить IPv4-диапазоны Cloudflare" >&2; exit 1; }
+
+[[ -s "$TMP_V4" ]] || { echo "STOP: пустой ответ при загрузке IPv4-диапазонов Cloudflare" >&2; exit 1; }
+
+VALID_V4="$(python3 - "$TMP_V4" <<'PY'
+import ipaddress, sys
+from pathlib import Path
+
+if len(sys.argv) < 2 or not sys.argv[1]:
+    raise SystemExit("missing TMP_V4 path")
+p = Path(sys.argv[1])
+if not p.is_file():
+    raise SystemExit(f"not a regular file: {p}")
+
+seen = set()
+for raw in p.read_text(encoding="utf-8").splitlines():
+    s = raw.strip()
+    if not s:
+        continue
+    net = ipaddress.ip_network(s, strict=True)
+    if net.version != 4 or net.prefixlen == 0:
+        raise SystemExit(f"invalid IPv4 prefix: {s}")
+    seen.add(str(net))
+if len(seen) < 15:
+    raise SystemExit(f"too few IPv4 prefixes: {len(seen)}")
+print("\n".join(sorted(seen, key=ipaddress.ip_network)))
+PY
+)"
+
+[[ -n "$VALID_V4" ]] || { echo "STOP: пустой список валидных IPv4-префиксов" >&2; exit 1; }
+
+# Атомарная инициализация/обновление ipset cf_ips_v4 без разрыва ссылок iptables
+"${IPSET_CMD[@]}" destroy "$TMP_SET" >/dev/null 2>&1 || true
+"${IPSET_CMD[@]}" create "$TMP_SET" hash:net family inet
+
+while IFS= read -r cidr; do
+    [[ -n "$cidr" ]] && "${IPSET_CMD[@]}" add "$TMP_SET" "$cidr" -exist
+done <<< "$VALID_V4"
+
+if HDR="$("${IPSET_CMD[@]}" list -t cf_ips_v4 2>/dev/null)"; then
+    CUR_TYPE="$(printf '%s\n' "$HDR" | awk -F': ' '/^Type:/ {print $2}')"
+    CUR_FAM="$(printf '%s\n' "$HDR" | awk '/^Header:/ {for(i=1;i<=NF;i++) if($i=="family") print $(i+1)}')"
+    [[ "$CUR_TYPE" == "hash:net" && "$CUR_FAM" == "inet" ]] \
+        || { echo "STOP: существующий cf_ips_v4 несовместим (type=${CUR_TYPE:-?}, family=${CUR_FAM:-?}), ожидается hash:net/inet" >&2; exit 1; }
+else
+    "${IPSET_CMD[@]}" create cf_ips_v4 hash:net family inet
+fi
+
+"${IPSET_CMD[@]}" swap "$TMP_SET" cf_ips_v4
+"${IPSET_CMD[@]}" destroy "$TMP_SET"
+
+# Правила DOCKER-USER: разрешаем ESTABLISHED,RELATED и входящий (DNAT) трафик на 80,443 только из cf_ips_v4
+del_rule() {
+    while "${IPT_CMD[@]}" -C DOCKER-USER "$@" 2>/dev/null; do
+        "${IPT_CMD[@]}" -D DOCKER-USER "$@"
+    done
+}
+
+del_rule -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+del_rule -p tcp -m multiport --dports 80,443 -m set --match-set cf_ips_v4 src -j RETURN
+del_rule -p tcp -m multiport --dports 80,443 -j DROP
+del_rule -m conntrack --ctstate DNAT -p tcp -m multiport --dports 80,443 -m set --match-set cf_ips_v4 src -j RETURN
+del_rule -m conntrack --ctstate DNAT -p tcp -m multiport --dports 80,443 -j DROP
+
+"${IPT_CMD[@]}" -I DOCKER-USER 1 -m conntrack --ctstate DNAT -p tcp -m multiport --dports 80,443 -j DROP
+"${IPT_CMD[@]}" -I DOCKER-USER 1 -m conntrack --ctstate DNAT -p tcp -m multiport --dports 80,443 -m set --match-set cf_ips_v4 src -j RETURN
+"${IPT_CMD[@]}" -I DOCKER-USER 1 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+
+STEP=2.7.1
+DATE_UTC="$(date -u +%FT%T)"
+NOTE="Набор ipset cf_ips_v4 (hash:net) заполнен, правила DOCKER-USER установлены"
+OUTPUT="cf_ips_v4=$(printf '%s\n' "$VALID_V4" | wc -l | tr -d ' ')"
+printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
+)
+```
+
+**Ожидаемый результат:** Набор `cf_ips_v4` (`hash:net`) создан и заполнен актуальными IPv4-префиксами Cloudflare ($\ge 15$ записей), а в цепочке `DOCKER-USER` установлены правила разрешения `RELATED,ESTABLISHED` и трафика на TCP-порты `80,443` исключительно из `cf_ips_v4` с отбросом прочего входящего трафика на `80,443`.
+
+**Условия остановки:** Ошибка загрузки или валидации префиксов Cloudflare, отсутствие прав `sudo -n` либо ошибка `ipset`/`iptables`.
 
 ### 2.8. Проверка входного межсетевого экрана (Cloudflare allowlist)
 
@@ -1407,9 +1570,9 @@ fi
 
 CF_IPS_FILE="$TARGET_DIR/data/nginx-dynamic/cloudflare-ips.conf"
 if [[ ! -f "$CF_IPS_FILE" ]]; then
-    [[ -f "$TARGET_DIR/nginx/cloudflare-ips.seed.conf" ]] \
-        || { echo "STOP: отсутствует nginx/cloudflare-ips.seed.conf для первичного bootstrap (ADR-010)" >&2; exit 1; }
-    install -m 0644 "$TARGET_DIR/nginx/cloudflare-ips.seed.conf" "$CF_IPS_FILE"
+    [[ -f "$TARGET_DIR/nginx/cloudflare-ips.conf" ]] \
+        || { echo "STOP: отсутствует nginx/cloudflare-ips.conf для первичного bootstrap (ADR-010)" >&2; exit 1; }
+    install -m 0644 "$TARGET_DIR/nginx/cloudflare-ips.conf" "$CF_IPS_FILE"
 fi
 
 APP_ENV="$APP_ENV" APP_IMAGE_TAG="${APP_IMAGE_TAG:-check}" ./scripts/cc.sh config -q
