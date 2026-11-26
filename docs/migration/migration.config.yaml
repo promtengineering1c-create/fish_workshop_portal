@@ -59,9 +59,8 @@ journal:
   # Не должен находиться внутри target.project_dir.
   path: /srv/deploy_tmp/fish_workshop_portal/migration.log
 
-  # [IF migration.mode = update] Абсолютный каталог артефактов отката.
+  # [MUST] Абсолютный каталог артефактов отката.
   # Не должен находиться внутри target.project_dir.
-  # [IF migration.mode = initial] допускается null.
   rollback_dir: /srv/backups/fish_workshop_portal/rollback
 
 # =============================================================================
@@ -84,7 +83,7 @@ source:
 target:
   ssh:
     # [MUST] Адрес production-сервера для SSH.
-    host: uralsfish.ru # 95.181.154.236
+    host: 95.181.154.236 # uralsfish.ru
     # [MUST] SSH-порт, целое число.
     port: 22
     # [MUST] Учётная запись SSH на целевом сервере.

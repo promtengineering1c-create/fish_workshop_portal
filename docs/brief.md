@@ -148,3 +148,14 @@ APP_ENV=development ./scripts/cc.sh exec web python manage.py createsuperuser
 
 # Deploy mode:ininitial
 
+На **исходном сервере (`kali`)** вывести существующий публичный ключ (или создать новый, если `~/.ssh/*.pub` отсутствует):
+ls -la ~/.ssh/*.pub 2>/dev/null || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+     cat ~/.ssh/id_ed25519.pub
+
+На **целевом сервере (`uralsfish.ru`)** в вашей текущей сессии с машины оператора добавить скопированную строку `ssh-ed25519 ...` в `/home/uralsfish/.ssh/authorized_keys` с обязательными правами `700` на `~/.ssh` и `600` на `authorized_keys`:
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        printf '%s\n' 'ВСТАВЬТЕ_СЮДА_СТРОКУ_ИЗ_id_ed25519.pub' >> ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+
+sudo apt-get update && sudo apt-get install -y apache2-utils
+command -v htpasswd        

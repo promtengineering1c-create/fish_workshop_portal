@@ -172,104 +172,148 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 **Ожидаемый результат:** Выведены атрибуты файла `docker-compose.yml`. Директория существует и содержит конфигурацию проекта.
 
-### 2.6. Проверка базового ПО целевого сервера
+    ### 2.6. Проверка ПО, инструментария и прав целевого сервера
 
-**Место выполнения:** целевой сервер, Bash.
+    **Место выполнения:** целевой сервер, Bash.
 
-```bash
-VERSION=$(docker --version)
-COMPOSE_VERSION=$(docker compose version)
-if command -v docker-rollout >/dev/null 2>&1 || docker rollout --help >/dev/null 2>&1; then
-    ROLLOUT_STATUS="docker-rollout: ok"
-else
-    ROLLOUT_STATUS="docker-rollout: absent (fallback up -d)"
-fi
+    ```bash
+    (
+    set -Eeuo pipefail
 
-STEP=2.6; 
-DATE_UTC="$(date -u +%FT%T)"
-NOTE='Базовое ПО проверено'; 
-OUTPUT="$VERSION; $COMPOSE_VERSION; $ROLLOUT_STATUS"
+    TARGET_DIR="/srv/apps/fish_workshop_portal"
+    MIGRATION_MODE="initial"
+    APP_ENV="production"
+    CODE_DELIVERY_METHOD="remote_git"
 
-printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
-```
+    REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
 
-**Ожидаемый результат:** Установлены Docker и плагин `docker compose` версии `>= 2.24` (ADR-011); зафиксировано наличие `docker-rollout` (для бесшовного обновления `start-first` либо отсутствие плагина — в этом случае на шаге выкатки допускается fallback `up -d` с окном недоступности 5–15 с).
+    for v in TARGET_DIR MIGRATION_MODE APP_ENV CODE_DELIVERY_METHOD; do
+        val="${!v}"
+        [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
+            || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
+    done
 
-### 2.6.1. Проверка установки `ipset` на целевом сервере
+    [[ "$TARGET_DIR" == /* ]] \
+        || { echo "STOP: TARGET_DIR должна быть абсолютным путём: '$TARGET_DIR'" >&2; exit 26; }
 
-**Место выполнения:** целевой сервер, Bash.
+    case "$MIGRATION_MODE" in
+        initial|update) ;;
+        *) echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2; exit 25 ;;
+    esac
 
-*(Выполняется при `migration.config.yaml: migration.mode` — `initial` для окружения `production` или при `REQUIRE_FIREWALL=1`. При `update` и в `development`/`staging` шаг пропускается)*
+    case "$CODE_DELIVERY_METHOD" in
+        remote_git|local_git|no_git) ;;
+        *) echo "STOP: CODE_DELIVERY_METHOD='$CODE_DELIVERY_METHOD', ожидается 'remote_git', 'local_git' или 'no_git'" >&2; exit 25 ;;
+    esac
 
-```bash
-(
-set -Eeuo pipefail
+    BASE_BINS=(python3 rsync tar gzip curl openssl sha256sum)
+    if [[ "$CODE_DELIVERY_METHOD" == "remote_git" || "$CODE_DELIVERY_METHOD" == "local_git" ]]; then
+        BASE_BINS+=(git)
+    fi
 
-MIGRATION_MODE="initial"
-APP_ENV="production"
+    MISSING_BASE=()
+    for bin in "${BASE_BINS[@]}"; do
+        command -v "$bin" >/dev/null 2>&1 || MISSING_BASE+=("$bin")
+    done
+    [[ "${#MISSING_BASE[@]}" -eq 0 ]] \
+        || { echo "STOP: на целевом сервере отсутствуют обязательные утилиты: ${MISSING_BASE[*]}" >&2; exit 1; }
 
-REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
+    command -v docker >/dev/null 2>&1 || { echo "STOP: утилита docker не найдена" >&2; exit 1; }
+    docker info >/dev/null 2>&1 || { echo "STOP: docker daemon недоступен для пользователя $(id -un)" >&2; exit 1; }
 
-for v in MIGRATION_MODE APP_ENV; do
-    val="${!v}"
-    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
-        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
-done
+    DOCKER_VER="$(docker --version)"
+    COMPOSE_SHORT="$(docker compose version --short 2>/dev/null | sed 's/^v//')" \
+        || { echo "STOP: плагин docker compose не установлен" >&2; exit 1; }
 
-case "$MIGRATION_MODE" in
-    initial) ;;
-    update)
-        echo "2.6.1: mode=update — проверка установки ipset пропускается."
-        exit 0
-        ;;
-    *)
-        echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2
-        exit 25
-        ;;
-esac
+    python3 - "$COMPOSE_SHORT" <<'PY' || { echo "STOP: требуется docker compose >= 2.24 (ADR-011), установлено: '$COMPOSE_SHORT'" >&2; exit 1; }
+    import re, sys
+    m = re.match(r'^(\d+)\.(\d+)', sys.argv[1].strip())
+    if not m or (int(m.group(1)), int(m.group(2))) < (2, 24):
+        sys.exit(1)
+    PY
 
-if [[ -z "$REQUIRE_FIREWALL" ]]; then
-    [[ "$APP_ENV" == "production" ]] && REQUIRE_FIREWALL="1" || REQUIRE_FIREWALL="0"
-fi
+    if command -v docker-rollout >/dev/null 2>&1 \
+        || docker info --format '{{range .ClientInfo.Plugins}}{{.Name}} {{end}}' 2>/dev/null | grep -qw rollout; then
+        ROLLOUT_STATUS="ok"
+    else
+        ROLLOUT_STATUS="absent(fallback up -d)"
+    fi
 
-if [[ "$REQUIRE_FIREWALL" != "1" ]]; then
-    echo "2.6.1: APP_ENV=$APP_ENV, REQUIRE_FIREWALL=$REQUIRE_FIREWALL — проверка установки ipset пропускается."
-    exit 0
-fi
+    HTPASSWD_STATUS="ok"
+    if ! command -v htpasswd >/dev/null 2>&1; then
+        if [[ "$MIGRATION_MODE" == "initial" ]]; then
+            echo "STOP: утилита htpasswd (пакет apache2-utils) не найдена — требуется для генерации .htpasswd на шаге 4.3.2 (ADR-010)" >&2
+            exit 1
+        elif [[ -s "$TARGET_DIR/data/nginx-dynamic/.htpasswd" ]]; then
+            HTPASSWD_STATUS="absent(existing .htpasswd)"
+        else
+            echo "STOP: утилита htpasswd не найдена, а файл '$TARGET_DIR/data/nginx-dynamic/.htpasswd' отсутствует или пуст" >&2
+            exit 1
+        fi
+    fi
 
-IPSET_BIN=""
-if command -v ipset >/dev/null 2>&1; then
-    IPSET_BIN="$(command -v ipset)"
-elif [[ -x /usr/sbin/ipset ]]; then
-    IPSET_BIN="/usr/sbin/ipset"
-elif [[ -x /sbin/ipset ]]; then
-    IPSET_BIN="/sbin/ipset"
-else
-    echo "STOP: утилита ipset не установлена (установите пакет ipset: sudo apt-get update && sudo apt-get install -y ipset)" >&2
-    exit 1
-fi
+    CHGRP_STATUS="ok(root)"
+    if [[ "${EUID}" -ne 0 ]]; then
+        if [[ "$MIGRATION_MODE" == "initial" || ! -s "$TARGET_DIR/data/nginx-dynamic/.htpasswd" ]]; then
+            NGINX_GID="${NGINX_WORKER_GID:-101}"
+            CHGRP_PROBE="$(mktemp /tmp/htpasswd.probe.XXXXXX)"
+            trap 'rm -f "${CHGRP_PROBE:-}"' EXIT
+            if sudo -n chgrp "${NGINX_GID}" "$CHGRP_PROBE" >/dev/null 2>&1; then
+                CHGRP_STATUS="ok(sudo)"
+            else
+                echo "STOP: требуется NOPASSWD sudo для 'chgrp ${NGINX_GID}' при генерации .htpasswd на шаге 4.3.2 (ADR-010)" >&2
+                exit 1
+            fi
+            rm -f "$CHGRP_PROBE"
+            trap - EXIT
+        else
+            CHGRP_STATUS="skipped(existing .htpasswd)"
+        fi
+    fi
 
-IPSET_CMD=("$IPSET_BIN")
-if [[ "${EUID}" -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || { echo "STOP: требуется root или sudo для проверки ipset" >&2; exit 1; }
-    IPSET_CMD=(sudo -n "$IPSET_BIN")
-fi
+    if [[ -z "$REQUIRE_FIREWALL" ]]; then
+        [[ "$APP_ENV" == "production" ]] && REQUIRE_FIREWALL="1" || REQUIRE_FIREWALL="0"
+    fi
 
-IPSET_RAW="$("${IPSET_CMD[@]}" -v 2>&1)" \
-    || { echo "STOP: '${IPSET_CMD[*]} -v' завершилась с ошибкой: $IPSET_RAW" >&2; exit 1; }
-IPSET_VER="$(printf '%s\n' "$IPSET_RAW" | sed -n '1p' | tr -d '\r')"
+    find_bin() {
+        local name="$1"
+        if command -v "$name" >/dev/null 2>&1; then
+            command -v "$name"
+        elif [[ -x "/usr/sbin/$name" ]]; then
+            printf '/usr/sbin/%s\n' "$name"
+        elif [[ -x "/sbin/$name" ]]; then
+            printf '/sbin/%s\n' "$name"
+        else
+            return 1
+        fi
+    }
 
-STEP=2.6.1
-DATE_UTC="$(date -u +%FT%T)"
-NOTE="Утилита ipset установлена"
-OUTPUT="bin=${IPSET_BIN}; ver=${IPSET_VER}"
-printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
-)
-```
+    FW_TOOLS_STATUS="skipped"
+    if [[ "$REQUIRE_FIREWALL" == "1" ]]; then
+        find_bin iptables >/dev/null 2>&1 || { echo "STOP: утилита iptables не найдена (ADR-010)" >&2; exit 1; }
+        IPSET_BIN="$(find_bin ipset)" || { echo "STOP: утилита ipset не установлена (sudo apt-get update && sudo apt-get install -y ipset)" >&2; exit 1; }
 
-**Ожидаемый результат:** Утилита `ipset` установлена на целевом сервере и доступна для работы с наборами IP-адресов (`ADR-010`).
+        IPSET_CMD=("$IPSET_BIN")
+        if [[ "${EUID}" -ne 0 ]]; then
+            IPSET_CMD=(sudo -n "$IPSET_BIN")
+        fi
+        IPSET_RAW="$("${IPSET_CMD[@]}" -v 2>&1)" \
+            || { echo "STOP: '${IPSET_CMD[*]} -v' завершилась с ошибкой: $IPSET_RAW" >&2; exit 1; }
+        IPSET_VER="$(printf '%s\n' "$IPSET_RAW" | sed -n '1p' | tr -d '\r')"
+        FW_TOOLS_STATUS="ok(${IPSET_VER})"
+    fi
 
-**Условия остановки:** Неподставленные параметры либо отсутствие бинарного файла `ipset`.
+    STEP=2.6
+    DATE_UTC="$(date -u +%FT%T)"
+    NOTE="ПО, инструментарий и права целевого сервера проверены"
+    OUTPUT="docker=${DOCKER_VER}; compose=${COMPOSE_SHORT}; rollout=${ROLLOUT_STATUS}; base=ok; htpasswd=${HTPASSWD_STATUS}; chgrp=${CHGRP_STATUS}; fw=${FW_TOOLS_STATUS}"
+    printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
+    )
+    ```
+
+    **Ожидаемый результат:** Установлены Docker, `docker compose >= 2.24` (ADR-011), базовые утилиты (`python3`, `rsync`, `tar`, `gzip`, `curl`, `openssl`, `sha256sum`, а при `remote_git`/`local_git` — `git`); зафиксировано наличие `docker-rollout` (при отсутствии допускается fallback `up -d` с окном 5–15 с); при `initial` или отсутствии `.htpasswd` доступны `htpasswd` и право `chgrp` на группу worker-процесса Nginx; при `REQUIRE_FIREWALL=1` доступны `iptables` и `ipset` (ADR-010).
+
+    **Условия остановки:** Неподставленные параметры, версия `docker compose < 2.24`, отсутствие обязательной утилиты, отсутствие `htpasswd` или прав `sudo -n chgrp`, либо недоступность `iptables`/`ipset` при `REQUIRE_FIREWALL=1`.
 
 ### 2.7. Подготовка целевой директории
 
@@ -314,12 +358,12 @@ MIGRATION_MODE="initial"
 require_value TARGET_DIR "$TARGET_DIR" path || exit 26
 require_value JOURNAL "$JOURNAL" path || exit 26
 require_value MIGRATION_MODE "$MIGRATION_MODE" plain || exit 26
+require_value ROLLBACK_DIR "$ROLLBACK_DIR" path || exit 26
 
 case "$MIGRATION_MODE" in
     initial)
         ;;
     update)
-        require_value ROLLBACK_DIR "$ROLLBACK_DIR" path || exit 26
         ;;
     *)
         echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2
@@ -329,8 +373,7 @@ esac
 
 TARGET_DIR="${TARGET_DIR%/}"
 
-DIRS_TO_CREATE=("$TARGET_DIR" "$(dirname -- "$JOURNAL")")
-[[ "$MIGRATION_MODE" == "update" ]] && DIRS_TO_CREATE+=("$ROLLBACK_DIR")
+DIRS_TO_CREATE=("$TARGET_DIR" "$(dirname -- "$JOURNAL")" "$ROLLBACK_DIR")
 
 for d in "${DIRS_TO_CREATE[@]}"; do
     mkdir -p "$d" 2>/dev/null \
@@ -622,67 +665,33 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 Шаги 4.2 (варианты Б и В), 4.3.1.А, 4.4 (вариант В) и 5.1 отправляют данные с исходного сервера на целевой по SSH. Ключевая аутентификация должна работать без запроса пароля (по ключу либо через `ssh -A` на время сессии).
 
 ```bash
-TARGET_SSH_PORT=⚠️**<target.ssh.port>**
-TARGET_SSH_USER=⚠️**<target.ssh.user>**
-TARGET_SSH_HOST=⚠️**<target.ssh.host>**
+(
+set -Eeuo pipefail
+
+TARGET_SSH_PORT=22
+TARGET_SSH_USER=uralsfish
+TARGET_SSH_HOST=95.181.154.236
 
 command -v rsync >/dev/null 2>&1 || { echo "STOP: rsync не найден на исходном сервере" >&2; exit 1; }
-ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
-    "$TARGET_SSH_USER"@"$TARGET_SSH_HOST" 'echo PUSH_OK; id -un; command -v rsync'
+REMOTE_INFO="$(ssh -p "$TARGET_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 \
+    "$TARGET_SSH_USER"@"$TARGET_SSH_HOST" \
+    'command -v rsync >/dev/null 2>&1 || { echo "STOP: rsync не найден на целевом сервере" >&2; exit 1; }; printf "user=%s; rsync=ok" "$(id -un)"')"
+
+STEP=2.9
+DATE_UTC="$(date -u +%FT%T)"
+NOTE="Прямой доступ исходный -> целевой по SSH и rsync проверен"
+OUTPUT="target=${TARGET_SSH_USER}@${TARGET_SSH_HOST}:${TARGET_SSH_PORT};${REMOTE_INFO}"
+printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
+)
 ```
 
 **Ожидаемый результат:** `PUSH_OK`, имя пользователя совпадает с `target.ssh.user`, `rsync` присутствует на обоих серверах.
 
 **Условия остановки:** `Permission denied`, `Host key verification failed`, таймаут, отсутствие `rsync` на исходном или целевом сервере.
 
-### 2.10.1. Проверка прав чтения на исходном сервере
-
-**Место выполнения:** исходный сервер, Bash.
-
-```bash
-(
-set -Eeuo pipefail
-
-SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
-
-[[ -n "$SOURCE_PROJECT_DIR" && "$SOURCE_PROJECT_DIR" != *'⚠️'* && "$SOURCE_PROJECT_DIR" != *'<'* && "$SOURCE_PROJECT_DIR" != *'>'* && "$SOURCE_PROJECT_DIR" != *'['* && "$SOURCE_PROJECT_DIR" != *']'* && "$SOURCE_PROJECT_DIR" != *'**'* ]] \
-    || { echo "STOP: SOURCE_PROJECT_DIR не подставлена: '$SOURCE_PROJECT_DIR'" >&2; exit 26; }
-
-[[ -d "$SOURCE_PROJECT_DIR" && -r "$SOURCE_PROJECT_DIR" && -x "$SOURCE_PROJECT_DIR" ]] \
-    || { echo "STOP: каталог '$SOURCE_PROJECT_DIR' недоступен для чтения пользователю $(id -un)" >&2; exit 1; }
-
-[[ -r "$SOURCE_PROJECT_DIR/docker-compose.yml" ]] \
-    || { echo "STOP: файл '$SOURCE_PROJECT_DIR/docker-compose.yml' недоступен для чтения" >&2; exit 1; }
-
-UNREADABLE_ENV="$(find "$SOURCE_PROJECT_DIR" -maxdepth 1 -name '.env*' ! -readable 2>/dev/null || true)"
-[[ -z "$UNREADABLE_ENV" ]] \
-    || { echo "STOP: на источнике есть нечитаемые файлы окружения: $UNREADABLE_ENV" >&2; exit 1; }
-
-DOCKER_SRC="absent"
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    DOCKER_SRC="ok"
-fi
-
-UNREADABLE_DATA=0
-if [[ -d "$SOURCE_PROJECT_DIR/data" ]]; then
-    UNREADABLE_DATA="$(find "$SOURCE_PROJECT_DIR/data" ! -readable 2>/dev/null | wc -l | tr -d ' ')"
-fi
-
-STEP=2.10.1
-DATE_UTC="$(date -u +%FT%T)"
-NOTE="Права чтения на исходном сервере проверены"
-OUTPUT="user=$(id -un); src_dir=ok; docker=${DOCKER_SRC}; unreadable_data=${UNREADABLE_DATA}"
-printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
-)
-```
-
-**Ожидаемый результат:** Выведено `src_dir=ok`; каталог проекта, `docker-compose.yml` и файлы `.env*` доступны для чтения текущему пользователю (должен совпадать с `⚠️**<source.ssh.user>**`). При использовании шага `4.4` (вариант В) подтверждено `docker=ok`; при переносе `data/ssl` или `data/letsencrypt` на шаге `5.1` учтено наличие файлов с правами `0600` (`unreadable_data > 0`).
-
-**Условия остановки:** Отсутствие прав на чтение `source.project_dir`, `docker-compose.yml` или `.env*`; отсутствие `docker=ok` при запланированном экспорте образов (`4.4.В`).
-
 ### 2.11. Проверка синхронизации времени
 
-Место выполнения: исходный и целевой серверы, Bash.
+Место выполнения целевой серверы, Bash.
 
 Имена артефактов (TS, db_rollback_<TS>.dump), порядок записей в журнале и сравнение mtime при сверке бэкапов опираются на системные часы.
 
@@ -691,35 +700,9 @@ timedatectl | sed -n '1,6p'
 date -u +'%s %FT%TZ' 
 ```
 
-Ожидаемый результат: System clock synchronized: yes, NTP service: active. Расхождение выводов date -u %s между серверами — не более 2 с.
-
-Условия остановки: расхождение более 2 с — устранить до выполнения шага 3 (сдвиг часов искажает порядок артефактов и делает журнал неупорядочиваемым).
+Ожидаемый результат: System clock synchronized: yes, NTP service: active. 
 
 ### 2.12. Проверка свободного места на дисках и размера БД
-
-**Место выполнения:** исходный сервер, Bash.
-
-```bash
-(
-set -Eeuo pipefail
-
-SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
-
-[[ -n "$SOURCE_PROJECT_DIR" && "$SOURCE_PROJECT_DIR" != *'⚠️'* && "$SOURCE_PROJECT_DIR" != *'<'* && "$SOURCE_PROJECT_DIR" != *'>'* && "$SOURCE_PROJECT_DIR" != *'['* && "$SOURCE_PROJECT_DIR" != *']'* && "$SOURCE_PROJECT_DIR" != *'**'* ]] \
-    || { echo "STOP: SOURCE_PROJECT_DIR не подставлена: '$SOURCE_PROJECT_DIR'" >&2; exit 26; }
-
-df -Ph "$SOURCE_PROJECT_DIR" /tmp | awk 'NR==1 || !seen[$0]++'
-
-SRC_AVAIL="$(df -Ph "$SOURCE_PROJECT_DIR" | awk 'NR==2 {print $4}')"
-TMP_AVAIL="$(df -Ph /tmp | awk 'NR==2 {print $4}')"
-
-STEP=2.12
-DATE_UTC="$(date -u +%FT%T)"
-NOTE="Свободное место на исходном сервере проверено"
-OUTPUT="src_avail=${SRC_AVAIL}; tmp_avail=${TMP_AVAIL}"
-printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
-)
-```
 
 **Место выполнения:** целевой сервер, Bash.
 
@@ -727,10 +710,10 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 (
 set -Eeuo pipefail
 
-TARGET_DIR="⚠️**<target.project_dir>**"
-ROLLBACK_DIR="⚠️**<journal.rollback_dir>**"
-MIGRATION_MODE="⚠️**<migration.mode>**"
-APP_ENV="⚠️**<application.app_env>**"
+TARGET_DIR="/srv/apps/fish_workshop_portal"
+ROLLBACK_DIR="/srv/backups/fish_workshop_portal/rollback"
+MIGRATION_MODE="initial"
+APP_ENV="production"
 
 for v in TARGET_DIR ROLLBACK_DIR MIGRATION_MODE APP_ENV; do
     val="${!v}"
@@ -767,105 +750,6 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 **Ожидаемый результат:** На исходном сервере достаточно свободного места в каталоге проекта и `/tmp` для сборки `repo.bundle` и/или архива образов. На целевом сервере достаточно места в `target.project_dir`, `journal.rollback_dir` (при `update` — с запасом под страховочный дамп БД относительно `db_size`) и `DockerRootDir` (под образы и именованные тома `pgdata`, `redisdata`, `static_volume`, `cache_volume`, `exchange_volume`).
 
 **Условия остановки:** Недостаток свободного места на любом из разделов; при `mode = update` — невозможность определить размер БД или нехватка свободного места в `journal.rollback_dir` под страховочный дамп.
-
-### 2.13. Проверка инструментария целевого сервера
-
-**Место выполнения:** целевой сервер, Bash.
-
-```bash
-(
-set -Eeuo pipefail
-
-TARGET_DIR="⚠️**<target.project_dir>**"
-MIGRATION_MODE="⚠️**<migration.mode>**"
-APP_ENV="⚠️**<application.app_env>**"
-REQUIRE_FIREWALL="${REQUIRE_FIREWALL:-}"
-
-for v in TARGET_DIR MIGRATION_MODE APP_ENV; do
-    val="${!v}"
-    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
-        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
-done
-
-case "$MIGRATION_MODE" in
-    initial|update) ;;
-    *) echo "STOP: MIGRATION_MODE='$MIGRATION_MODE', ожидается 'initial' или 'update'" >&2; exit 25 ;;
-esac
-
-MISSING_BASE=()
-for bin in python3 rsync tar gzip curl openssl sha256sum; do
-    command -v "$bin" >/dev/null 2>&1 || MISSING_BASE+=("$bin")
-done
-[[ "${#MISSING_BASE[@]}" -eq 0 ]] \
-    || { echo "STOP: на целевом сервере отсутствуют обязательные утилиты: ${MISSING_BASE[*]}" >&2; exit 1; }
-
-HTPASSWD_STATUS="ok"
-if ! command -v htpasswd >/dev/null 2>&1; then
-    if [[ "$MIGRATION_MODE" == "initial" ]]; then
-        echo "STOP: утилита htpasswd (пакет apache2-utils) не найдена — требуется для генерации .htpasswd на шаге 4.3 (ADR-010)" >&2
-        exit 1
-    elif [[ -s "$TARGET_DIR/data/nginx-dynamic/.htpasswd" ]]; then
-        HTPASSWD_STATUS="absent (existing .htpasswd)"
-    else
-        echo "STOP: утилита htpasswd не найдена, а файл '$TARGET_DIR/data/nginx-dynamic/.htpasswd' отсутствует или пуст" >&2
-        exit 1
-    fi
-fi
-
-if [[ -z "$REQUIRE_FIREWALL" ]]; then
-    [[ "$APP_ENV" == "production" ]] && REQUIRE_FIREWALL="1" || REQUIRE_FIREWALL="0"
-fi
-
-find_bin() {
-    local name="$1"
-    if command -v "$name" >/dev/null 2>&1; then
-        command -v "$name"
-    elif [[ -x "/usr/sbin/$name" ]]; then
-        printf '/usr/sbin/%s\n' "$name"
-    elif [[ -x "/sbin/$name" ]]; then
-        printf '/sbin/%s\n' "$name"
-    else
-        return 1
-    fi
-}
-
-FW_TOOLS_STATUS="skipped"
-if [[ "$REQUIRE_FIREWALL" == "1" ]]; then
-    find_bin iptables >/dev/null 2>&1 || { echo "STOP: утилита iptables не найдена (ADR-010)" >&2; exit 1; }
-    find_bin ipset >/dev/null 2>&1 || { echo "STOP: утилита ipset не найдена (ADR-010)" >&2; exit 1; }
-    FW_TOOLS_STATUS="ok"
-fi
-
-CHGRP_STATUS="ok(root)"
-if [[ "${EUID}" -ne 0 ]]; then
-    if [[ "$MIGRATION_MODE" == "initial" || ! -s "$TARGET_DIR/data/nginx-dynamic/.htpasswd" ]]; then
-        NGINX_GID="${NGINX_WORKER_GID:-101}"
-        CHGRP_PROBE="$(mktemp "$TARGET_DIR/data/nginx-dynamic/.htpasswd.probe.XXXXXX")"
-        trap 'rm -f "${CHGRP_PROBE:-}"' EXIT
-        if sudo -n chgrp "${NGINX_GID}" "$CHGRP_PROBE" >/dev/null 2>&1; then
-            CHGRP_STATUS="ok(sudo)"
-        else
-            echo "STOP: требуется NOPASSWD sudo для 'chgrp ${NGINX_GID}' при генерации .htpasswd на шаге 4.3.2 (ADR-010)" >&2
-            exit 1
-        fi
-        rm -f "$CHGRP_PROBE"
-        trap - EXIT
-    else
-        CHGRP_STATUS="skipped(existing .htpasswd)"
-    fi
-fi
-
-STEP=2.13
-DATE_UTC="$(date -u +%FT%T)"
-NOTE="Инструментарий целевого сервера проверен"
-OUTPUT="base=ok; htpasswd=${HTPASSWD_STATUS}; chgrp=${CHGRP_STATUS}; fw_tools=${FW_TOOLS_STATUS}"
-printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
-)
-```
-
-*Ожидаемый результат:** На целевом сервере установлены `python3` (нужен `scripts/render_check.py` внутри `scripts/cc.sh`), `rsync`, `tar`, `gzip`, `curl`, `openssl`, `sha256sum`; при `mode = initial` (или отсутствии готового `.htpasswd`) доступна утилита `htpasswd` и подтверждено право `chgrp` (от `root` или через `sudo -n`) на группу worker-процесса Nginx; для `production` (или `REQUIRE_FIREWALL=1`) доступны `iptables` и `ipset`.
-
-**Условия остановки:** Отсутствие любой обязательной утилиты, отсутствие `htpasswd` или прав `sudo -n chgrp` при `mode = initial` (либо отсутствии `.htpasswd`), или отсутствие `iptables`/`ipset` при `REQUIRE_FIREWALL=1`.
 
 ## 3. Резервное копирование текущего состояния (только для `update`)
 
@@ -1081,6 +965,9 @@ for v in TARGET_DIR ROLLBACK_DIR MIGRATION_MODE CODE_DELIVERY_METHOD; do
     [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
         || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
 done
+
+[[ "$TARGET_DIR" == /* ]] \
+    || { echo "STOP: TARGET_DIR должна быть абсолютным путём: '$TARGET_DIR'" >&2; exit 26; }
 
 case "$MIGRATION_MODE" in
     initial|update) ;;
