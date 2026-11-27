@@ -68,3 +68,5 @@ exchange/error/*
 *.key
 
 temporary*
+
+brief.md

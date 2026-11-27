@@ -148,6 +148,34 @@ APP_ENV=development ./scripts/cc.sh exec web python manage.py createsuperuser
 
 # Deploy mode:ininitial
 
+# 1. Удаляем тег локально
+git tag -d 0.1.0
+
+# 2. Переходим на нужный коммит (где код рабочий)
+git checkout main  # или нужный коммит
+
+# 3. Создаем тег заново
+git tag 0.1.0
+
+# 4. Удаляем старый тег на сервере (в origin)
+git push origin :refs/tags/0.1.0
+
+# 5. Пушим новый тег на сервер
+git push origin 0.1.0
+
+или 
+
+git tag -f 0.1.0
+git push origin 0.1.0 -f
+
+git fetch
+git log origin/main --oneline --decorate -10
+
+cd /srv/apps/fish_workshop_portal
+git fetch --prune --tags --force origin
+git checkout -q --detach "refs/tags/0.1.0^{commit}"
+chmod +x scripts/*.sh
+
 На **исходном сервере (`kali`)** вывести существующий публичный ключ (или создать новый, если `~/.ssh/*.pub` отсутствует):
 ls -la ~/.ssh/*.pub 2>/dev/null || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
      cat ~/.ssh/id_ed25519.pub
