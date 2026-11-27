@@ -955,10 +955,10 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 (
 set -Eeuo pipefail
 
-TARGET_DIR="⚠️**<target.project_dir>**"
-ROLLBACK_DIR="⚠️**<journal.rollback_dir>**"
-MIGRATION_MODE="⚠️**<migration.mode>**"
-CODE_DELIVERY_METHOD="⚠️**<code_delivery.method>**"
+TARGET_DIR="/srv/apps/fish_workshop_portal"
+ROLLBACK_DIR="/srv/backups/fish_workshop_portal/rollback"
+MIGRATION_MODE="initial"
+CODE_DELIVERY_METHOD="remote_git"
 
 for v in TARGET_DIR ROLLBACK_DIR MIGRATION_MODE CODE_DELIVERY_METHOD; do
     val="${!v}"
@@ -1047,10 +1047,10 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 (
 set -Eeuo pipefail
 
-TARGET_DIR="⚠️**<target.project_dir>**"
-CODE_DELIVERY_METHOD="⚠️**<code_delivery.method>**"
-REMOTE_URL="⚠️**<code_delivery.remote_url>**"
-CODE_REF="⚠️**<code_delivery.ref>**"
+TARGET_DIR="/srv/apps/fish_workshop_portal"
+CODE_DELIVERY_METHOD="remote_git"
+REMOTE_URL="https://github.com/promtengineering1c-create/fish_workshop_portal.git"
+CODE_REF="0.1.0"
 
 for v in TARGET_DIR CODE_DELIVERY_METHOD REMOTE_URL CODE_REF; do
     val="${!v}"
@@ -1250,13 +1250,13 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 (
 set -Eeuo pipefail
 
-TARGET_DIR="⚠️**<target.project_dir>**"
-SOURCE_PROJECT_DIR="⚠️**<source.project_dir>**"
-MIGRATION_MODE="⚠️**<migration.mode>**"
-APP_ENV="⚠️**<application.app_env>**"
-TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
-TARGET_SSH_USER="⚠️**<target.ssh.user>**"
-TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
+TARGET_DIR="/srv/apps/fish_workshop_portal"
+SOURCE_PROJECT_DIR="/home/kali/projects/fish_workshop_portal"
+MIGRATION_MODE="initial"
+APP_ENV="production"
+TARGET_SSH_PORT="22"
+TARGET_SSH_USER="uralsfish"
+TARGET_SSH_HOST="95.181.154.236"
 
 for v in TARGET_DIR SOURCE_PROJECT_DIR MIGRATION_MODE APP_ENV TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST; do
     val="${!v}"
