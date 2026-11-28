@@ -125,9 +125,9 @@ preflight() {
   # ADR-010: bootstrap runtime directory and seed cloudflare-ips.conf if absent.
   mkdir -p data/nginx-dynamic
   if [[ ! -f data/nginx-dynamic/cloudflare-ips.conf ]]; then
-    [[ -f nginx/cloudflare-ips.seed.conf ]] \
-      || die "data/nginx-dynamic/cloudflare-ips.conf missing and nginx/cloudflare-ips.seed.conf not found"
-    install -m 0644 nginx/cloudflare-ips.seed.conf data/nginx-dynamic/cloudflare-ips.conf
+    [[ -f nginx/cloudflare-ips.conf ]] \
+      || die "data/nginx-dynamic/cloudflare-ips.conf missing and nginx/cloudflare-ips.conf not found"
+    install -m 0644 nginx/cloudflare-ips.conf data/nginx-dynamic/cloudflare-ips.conf
   fi
 
   [[ -f data/nginx-dynamic/.htpasswd ]] || die "data/nginx-dynamic/.htpasswd must be a regular file"

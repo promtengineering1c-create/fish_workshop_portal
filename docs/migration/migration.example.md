@@ -1279,18 +1279,39 @@ TARGET_SSH_PORT="⚠️**<target.ssh.port>**"
 TARGET_SSH_USER="⚠️**<target.ssh.user>**"
 TARGET_SSH_HOST="⚠️**<target.ssh.host>**"
 
-for v in TARGET_DIR SOURCE_PROJECT_DIR MIGRATION_MODE APP_ENV TARGET_SSH_PORT TARGET_SSH_USER TARGET_SSH_HOST; do
-    val="${!v}"
-    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
-        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
-done
+check_vars() {
+    while [ "$#" -ge 2 ]; do
+        v="$1"
+        val="$2"
+        shift 2
+        case "$val" in
+            ""|*'⚠️'*|*'<'*|*'>'*|*'['*|*']'*|*'**'*)
+                echo "STOP: $v не подставлена: '$val'" >&2
+                exit 26
+                ;;
+        esac
+    done
+}
 
-[[ "$MIGRATION_MODE" == "initial" ]] \
-    || { echo "STOP: выбран шаг 4.3.1.А (initial), но MIGRATION_MODE='$MIGRATION_MODE'" >&2; exit 25; }
+check_vars \
+    TARGET_DIR "$TARGET_DIR" \
+    SOURCE_PROJECT_DIR "$SOURCE_PROJECT_DIR" \
+    MIGRATION_MODE "$MIGRATION_MODE" \
+    APP_ENV "$APP_ENV" \
+    TARGET_SSH_PORT "$TARGET_SSH_PORT" \
+    TARGET_SSH_USER "$TARGET_SSH_USER" \
+    TARGET_SSH_HOST "$TARGET_SSH_HOST"
+
+if [ "$MIGRATION_MODE" != "initial" ]; then
+    echo "STOP: выбран шаг 4.3.1.А (initial), но MIGRATION_MODE='$MIGRATION_MODE'" >&2
+    exit 25
+fi
 
 cd "$SOURCE_PROJECT_DIR"
-[[ -f ".env" || -f ".env.${APP_ENV}" ]] \
-    || { echo "STOP: на исходном сервере отсутствуют .env и .env.${APP_ENV}" >&2; exit 1; }
+if [ ! -f ".env" ] && [ ! -f ".env.${APP_ENV}" ]; then
+    echo "STOP: на исходном сервере отсутствуют .env и .env.${APP_ENV}" >&2
+    exit 1
+fi
 
 rsync -az --chmod=F600 \
     --include='.env' \
@@ -1398,22 +1419,36 @@ printf '%s | %s | %s | %s\n' "$STEP" "$DATE_UTC" "$OUTPUT" "$NOTE"
 
 #### 4.3.2. Генерация `.htpasswd` из `.env*` и валидация конфигурации стека
 
-**Место выполнения:** целевой сервер, Bash.
+**Место выполнения:** целевой сервер, Bash / Zsh.
 
 ```bash
 (
-set -Eeuo pipefail
+set -euo pipefail
 
 TARGET_DIR="⚠️**<target.project_dir>**"
 MIGRATION_MODE="⚠️**<migration.mode>**"
 APP_ENV="⚠️**<application.app_env>**"
+
 FORCE_HTPASSWD="${FORCE_HTPASSWD:-0}"
 
-for v in TARGET_DIR MIGRATION_MODE APP_ENV; do
-    val="${!v}"
-    [[ -n "$val" && "$val" != *'⚠️'* && "$val" != *'<'* && "$val" != *'>'* && "$val" != *'['* && "$val" != *']'* && "$val" != *'**'* ]] \
-        || { echo "STOP: $v не подставлена: '$val'" >&2; exit 26; }
-done
+check_vars() {
+    while [ "$#" -ge 2 ]; do
+        v="$1"
+        val="$2"
+        shift 2
+        case "$val" in
+            ""|*'⚠️'*|*'<'*|*'>'*|*'['*|*']'*|*'**'*)
+                echo "STOP: $v не подставлена: '$val'" >&2
+                exit 26
+                ;;
+        esac
+    done
+}
+
+check_vars \
+    TARGET_DIR "$TARGET_DIR" \
+    MIGRATION_MODE "$MIGRATION_MODE" \
+    APP_ENV "$APP_ENV"
 
 cd "$TARGET_DIR"
 
